@@ -5,6 +5,7 @@ import (
 	"go-talk/models"
 	"go-talk/service"
 	"net/http"
+	"strings"
 )
 
 type AuthHandler struct {
@@ -50,5 +51,32 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{
 		"token": token,
 		"user":  user,
+	})
+}
+
+// GET /users/me
+func (h *AuthHandler) GetMe(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	parts := strings.Split(authHeader, " ")
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		http.Error(w, "Unauthorized: invalid authorization header", http.StatusUnauthorized)
+		return
+	}
+
+	userID, err := h.authSvc.ValidateToken(parts[1])
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	user, err := h.authSvc.GetUserProfile(r.Context(), userID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"user": user,
 	})
 }

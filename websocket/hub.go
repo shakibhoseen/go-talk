@@ -134,14 +134,39 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			}
 		}
 
-	case EventAckDelivered, EventAckSeen:
-		// ক্লায়েন্ট (User B) মেসেজ রিসিভ বা ওপেন করলে প্রেরকের কাছে টিক আপডেট পাঠানো
+	case EventAckDelivered:
 		var ack AckPayload
 		if err := json.Unmarshal(event.Payload, &ack); err != nil {
 			return
 		}
-		// যার মেসেজ ছিল (SenderID), তার কাছে স্ট্যাটাস আপডেট পুশ করা
-		h.SendDirect(ack.SenderID, EventStatusUpdated, ack)
+
+		// 1. DB-te delivered status mark kora
+		_ = h.chatRepo.MarkMessageDelivered(context.Background(), ack.MessageID, client.UserID)
+
+		// 2. Sender-ke double tick notify kora
+		h.SendDirect(ack.SenderID, EventStatusUpdated, map[string]any{
+			"conversation_id": ack.ConversationID,
+			"message_id":      ack.MessageID,
+			"status":          "delivered",
+			"by_user":         client.UserID,
+		})
+
+	case EventAckSeen:
+		var ack AckPayload
+		if err := json.Unmarshal(event.Payload, &ack); err != nil {
+			return
+		}
+
+		// 1. DB-te Range Seen update kora (Single Query Batch)
+		_ = h.chatRepo.MarkMessagesSeenUpto(context.Background(), ack.ConversationID, client.UserID, ack.MessageID)
+
+		// 2. Sender-ke blue tick notify kora
+		h.SendDirect(ack.SenderID, EventStatusUpdated, map[string]any{
+			"conversation_id": ack.ConversationID,
+			"upto_message_id": ack.MessageID,
+			"status":          "seen",
+			"by_user":         client.UserID,
+		})
 
 	case EventCallOffer, EventCallAnswer, EventIceCandidate, EventCallEnd:
 		// WebRTC Signaling Forwarding

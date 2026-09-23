@@ -15,6 +15,7 @@ type AuthService interface {
 	Register(ctx context.Context, req *models.RegisterRequest) (*models.User, error)
 	Login(ctx context.Context, req *models.LoginRequest) (string, *models.User, error)
 	ValidateToken(tokenStr string) (int, error)
+	GetUserProfile(ctx context.Context, userID int) (*models.User, error) // Notun
 }
 
 type authService struct {
@@ -98,4 +99,16 @@ func (s *authService) ValidateToken(tokenStr string) (int, error) {
 	}
 
 	return int(userIDFloat), nil
+}
+
+func (s *authService) GetUserProfile(ctx context.Context, userID int) (*models.User, error) {
+	u, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if u == nil {
+		return nil, errors.New("user not found")
+	}
+	u.PasswordHash = "" // Security: Hash jeno json response-e na jay
+	return u, nil
 }

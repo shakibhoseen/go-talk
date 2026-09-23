@@ -24,6 +24,7 @@ func main() {
 
 	// 3. Services
 	authSvc := service.NewAuthService(userRepo, cfg.JWTSecret)
+	chatSvc := service.NewChatService(chatRepo)
 
 	// 4. WebSocket Hub (Single Concurrency Goroutine)
 	hub := websocket.NewHub(chatRepo)
@@ -32,12 +33,23 @@ func main() {
 	// 5. Handlers
 	authHandler := handlers.NewAuthHandler(authSvc)
 	wsHandler := handlers.NewWSHandler(hub, authSvc)
+	chatHandler := handlers.NewChatHandler(chatSvc, authSvc)
 
 	// 6. Router Setup
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /auth/register", authHandler.Register)
 	mux.HandleFunc("POST /auth/login", authHandler.Login)
+	mux.HandleFunc("GET /users/me", authHandler.GetMe)
 	mux.HandleFunc("GET /ws", wsHandler.Handle)
+
+	// Notun Chat REST Endpoints:
+	mux.HandleFunc("POST /conversations/direct", chatHandler.CreateDirectChat)
+	mux.HandleFunc("GET /conversations", chatHandler.GetConversations)
+	mux.HandleFunc("GET /conversations/{id}/messages", chatHandler.GetMessages)
+	mux.HandleFunc("POST /conversations/group", chatHandler.CreateGroupChat)
+
+	mux.HandleFunc("POST /conversations/{id}/members", chatHandler.AddMember)
+	mux.HandleFunc("DELETE /conversations/{id}/members/{user_id}", chatHandler.RemoveMember)
 
 	// Health check endpoint
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {

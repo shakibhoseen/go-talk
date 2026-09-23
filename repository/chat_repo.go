@@ -22,6 +22,13 @@ type ChatRepository interface {
 
 	// Notun: Conversation-er sokol member ID ber kora
 	GetConversationMemberIDs(ctx context.Context, convID string) ([]int, error)
+
+	MarkMessageDelivered(ctx context.Context, messageID int64, userID int) error
+	MarkMessagesSeenUpto(ctx context.Context, convID string, userID int, uptoMessageID int64) error
+
+	CreateGroupConversation(ctx context.Context, title string, creatorID int, memberIDs []int) (string, error)
+	AddGroupMember(ctx context.Context, convID string, userID int, role string) error
+	RemoveGroupMember(ctx context.Context, convID string, userID int) error
 }
 
 type chatRepo struct {
@@ -189,4 +196,90 @@ func (r *chatRepo) GetConversationMemberIDs(ctx context.Context, convID string) 
 		memberIDs = append(memberIDs, uid)
 	}
 	return memberIDs, rows.Err()
+}
+
+func (r *chatRepo) MarkMessageDelivered(ctx context.Context, messageID int64, userID int) error {
+	query := `INSERT INTO message_receipts (message_id, user_id, status, updated_at)
+	          VALUES ($1, $2, 'delivered', NOW())
+	          ON CONFLICT (message_id, user_id) 
+	          DO UPDATE SET status = 'delivered', updated_at = NOW()
+	          WHERE message_receipts.status != 'seen'`
+	_, err := r.db.ExecContext(ctx, query, messageID, userID)
+	return err
+}
+
+func (r *chatRepo) MarkMessagesSeenUpto(ctx context.Context, convID string, userID int, uptoMessageID int64) error {
+	// Range ACK: 1 single indexed query-te uptoMessageID porjonto sob message-e 'seen' mark kora
+	query := `INSERT INTO message_receipts (message_id, user_id, status, updated_at)
+	          SELECT m.id, $1, 'seen', NOW()
+	          FROM messages m
+	          WHERE m.conversation_id = $2 
+	            AND m.id <= $3 
+	            AND m.sender_id != $1
+	          ON CONFLICT (message_id, user_id) 
+	          DO UPDATE SET status = 'seen', updated_at = NOW()`
+	_, err := r.db.ExecContext(ctx, query, userID, convID, uptoMessageID)
+	return err
+}
+
+func (r *chatRepo) CreateGroupConversation(ctx context.Context, title string, creatorID int, memberIDs []int) (string, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	// 1. Group conversation toiri kora
+	var convID string
+	query := `INSERT INTO conversations (type, title) VALUES ('group', $1) RETURNING id`
+	if err := tx.QueryRowContext(ctx, query, title).Scan(&convID); err != nil {
+		return "", err
+	}
+
+	// 2. Creator-ke 'admin' role hisabe insert kora
+	adminQuery := `INSERT INTO conversation_members (conversation_id, user_id, role) VALUES ($1, $2, 'admin')`
+	if _, err := tx.ExecContext(ctx, adminQuery, convID, creatorID); err != nil {
+		return "", err
+	}
+
+	// 3. Baki members-ke 'member' role hisabe insert kora
+	memberQuery := `INSERT INTO conversation_members (conversation_id, user_id, role) 
+	                VALUES ($1, $2, 'member') 
+	                ON CONFLICT (conversation_id, user_id) DO NOTHING`
+	for _, uid := range memberIDs {
+		if uid != creatorID {
+			if _, err := tx.ExecContext(ctx, memberQuery, convID, uid); err != nil {
+				return "", err
+			}
+		}
+	}
+
+	return convID, tx.Commit()
+}
+
+func (r *chatRepo) AddGroupMember(ctx context.Context, convID string, userID int, role string) error {
+	if role == "" {
+		role = "member"
+	}
+	query := `INSERT INTO conversation_members (conversation_id, user_id, role) 
+	          VALUES ($1, $2, $3) 
+	          ON CONFLICT (conversation_id, user_id) DO NOTHING`
+	_, err := r.db.ExecContext(ctx, query, convID, userID, role)
+	return err
+}
+
+func (r *chatRepo) RemoveGroupMember(ctx context.Context, convID string, userID int) error {
+	query := `DELETE FROM conversation_members WHERE conversation_id = $1 AND user_id = $2`
+	res, err := r.db.ExecContext(ctx, query, convID, userID)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errors.New("member not found in this conversation")
+	}
+	return nil
 }
