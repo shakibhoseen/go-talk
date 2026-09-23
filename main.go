@@ -56,6 +56,9 @@ func main() {
 		w.Write([]byte("go-talk engine is healthy!"))
 	})
 
-	fmt.Printf("🚀 go-talk server running on http://localhost%s\n", cfg.Port)
+	fmt.Printf("🚀 go-talk server running on http://192.168.22.254%s\n", cfg.Port)
 	log.Fatal(http.ListenAndServe(cfg.Port, mux))
+	// http.ListenAndServe(":8080", mux)
+	// ba
+	//log.Fatal(http.ListenAndServe("0.0.0.0:8080", mux))
 }
