@@ -29,6 +29,9 @@ type ChatRepository interface {
 	CreateGroupConversation(ctx context.Context, title string, creatorID int, memberIDs []int) (string, error)
 	AddGroupMember(ctx context.Context, convID string, userID int, role string) error
 	RemoveGroupMember(ctx context.Context, convID string, userID int) error
+
+	UpdateLastReadWatermark(ctx context.Context, convID string, userID int, messageID int64) error
+	GetGroupReadWatermarks(ctx context.Context, convID string) (map[int64][]models.ReadReceiptUser, error)
 }
 
 type chatRepo struct {
@@ -108,23 +111,37 @@ func (r *chatRepo) GetUserConversations(ctx context.Context, userID int) ([]mode
 
 func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, error) {
 	var query string
-	var rows *sql.Rows
-	var err error
+	var args []any
 
 	if beforeID > 0 {
-		query = `SELECT id, conversation_id, sender_id, message_type, content, created_at
-		         FROM messages
-		         WHERE conversation_id = $1 AND id < $2
-		         ORDER BY id DESC LIMIT $3`
-		rows, err = r.db.QueryContext(ctx, query, convID, beforeID, limit)
+		query = `
+			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.message_type, sub.content, sub.created_at
+			FROM (
+				SELECT id, conversation_id, sender_id, message_type, content, created_at
+				FROM messages
+				WHERE conversation_id = $1 AND id < $2
+				ORDER BY id DESC
+				LIMIT $3
+			) sub
+			JOIN users u ON sub.sender_id = u.id
+			ORDER BY sub.id DESC`
+		args = []any{convID, beforeID, limit}
 	} else {
-		query = `SELECT id, conversation_id, sender_id, message_type, content, created_at
-		         FROM messages
-		         WHERE conversation_id = $1
-		         ORDER BY id DESC LIMIT $2`
-		rows, err = r.db.QueryContext(ctx, query, convID, limit)
+		query = `
+			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.message_type, sub.content, sub.created_at
+			FROM (
+				SELECT id, conversation_id, sender_id, message_type, content, created_at
+				FROM messages
+				WHERE conversation_id = $1
+				ORDER BY id DESC
+				LIMIT $2
+			) sub
+			JOIN users u ON sub.sender_id = u.id
+			ORDER BY sub.id DESC`
+		args = []any{convID, limit}
 	}
 
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -133,13 +150,16 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, l
 	var msgs []models.Message
 	for rows.Next() {
 		var m models.Message
-		if err := rows.Scan(&m.ID, &m.ConversationID, &m.SenderID, &m.MessageType, &m.Content, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.SenderID, &m.SenderName, &m.SenderAvatar, &m.MessageType, &m.Content, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, m)
 	}
 
-	return msgs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return msgs, nil
 }
 
 func (r *chatRepo) GetOrCreateDirectConversation(ctx context.Context, user1, user2 int) (string, error) {
@@ -282,4 +302,48 @@ func (r *chatRepo) RemoveGroupMember(ctx context.Context, convID string, userID 
 		return errors.New("member not found in this conversation")
 	}
 	return nil
+}
+
+// UpdateLastReadWatermark: ইউজারের সর্বশেষ পঠিত মেসেজের পয়েন্টার আপডেট করে
+func (r *chatRepo) UpdateLastReadWatermark(ctx context.Context, convID string, userID int, messageID int64) error {
+	query := `
+		UPDATE conversation_members
+		SET last_read_message_id = $1
+		WHERE conversation_id = $2 
+		  AND user_id = $3 
+		  AND last_read_message_id < $1` // পয়েন্টার যাতে পেছনের দিকে না নামে
+
+	_, err := r.db.ExecContext(ctx, query, messageID, convID, userID)
+	return err
+}
+
+// GetGroupReadWatermarks: কোন মেসেজ আইডিতে কোন কোন ইউজার অবস্থান করছে তা রিটার্ন করে
+func (r *chatRepo) GetGroupReadWatermarks(ctx context.Context, convID string) (map[int64][]models.ReadReceiptUser, error) {
+	query := `
+		SELECT cm.last_read_message_id, u.id, u.name, COALESCE(u.avatar_url, '')
+		FROM conversation_members cm
+		JOIN users u ON cm.user_id = u.id
+		WHERE cm.conversation_id = $1 AND cm.last_read_message_id > 0`
+
+	rows, err := r.db.QueryContext(ctx, query, convID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	watermarks := make(map[int64][]models.ReadReceiptUser)
+	for rows.Next() {
+		var msgID int64
+		var user models.ReadReceiptUser
+		if err := rows.Scan(&msgID, &user.UserID, &user.Name, &user.AvatarURL); err != nil {
+			return nil, err
+		}
+		watermarks[msgID] = append(watermarks[msgID], user)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return watermarks, nil
 }

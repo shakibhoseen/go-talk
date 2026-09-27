@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"go-talk/models"
 	"go-talk/service"
 	"net/http"
 	"strconv"
@@ -91,15 +92,47 @@ func (h *ChatHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	beforeID, _ := strconv.ParseInt(r.URL.Query().Get("before_id"), 10, 64)
 
-	msgs, err := h.chatSvc.GetChatMessages(r.Context(), convID, limit, beforeID)
+	messages, err := h.chatSvc.GetChatMessages(r.Context(), convID, limit, beforeID)
 	if err != nil {
 		http.Error(w, "Failed to fetch messages", http.StatusInternalServerError)
 		return
 	}
 
+	// ২. মেম্বারদের ওয়াটারমার্ক (কার কতটুকু দেখা শেষ) ফেচ করা (নতুন মেথড)
+	watermarks, err := h.chatSvc.GetGroupReadWatermarks(r.Context(), convID)
+	if err != nil {
+		// এরর হলে খালি ম্যাপ ধরে প্রসেস করবে যাতে এপিআই ফেইল না করে
+		watermarks = make(map[int64][]models.ReadReceiptUser)
+	}
+
+	// handlers/chat_handler.go
+	const maxVisibleAvatars = 3
+	// ৩. মেসেজের সাথে ReadBy ইউজার তালিকা এটাচ করে ফাইনাল রেসপন্স লিস্ট বানানো
+	responseList := make([]models.MessageWithReceipts, 0, len(messages))
+	for _, m := range messages {
+		users := watermarks[m.ID]
+
+		var visibleUsers []models.ReadReceiptUser
+		totalRead := len(users)
+
+		if totalRead > maxVisibleAvatars {
+			visibleUsers = users[:maxVisibleAvatars]
+		} else if totalRead > 0 {
+			visibleUsers = users
+		} else {
+			visibleUsers = []models.ReadReceiptUser{}
+		}
+
+		responseList = append(responseList, models.MessageWithReceipts{
+			Message:   m,
+			ReadBy:    visibleUsers,
+			ReadCount: totalRead, // Flutter-e "+97" dekhate
+		})
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"messages": msgs,
+		"messages": responseList,
 	})
 }
 

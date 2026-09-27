@@ -15,15 +15,17 @@ type Hub struct {
 	register   chan *Client
 	unregister chan *Client
 	chatRepo   repository.ChatRepository
+	userRepo   repository.UserRepository
 }
 
-func NewHub(chatRepo repository.ChatRepository) *Hub {
+func NewHub(chatRepo repository.ChatRepository, userRepo repository.UserRepository) *Hub {
 	return &Hub{
 		clients:    make(map[int]map[*Client]bool),
 		broadcast:  make(chan []byte),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		chatRepo:   chatRepo,
+		userRepo:   userRepo,
 	}
 }
 
@@ -157,16 +159,51 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			return
 		}
 
-		// 1. DB-te Range Seen update kora (Single Query Batch)
-		_ = h.chatRepo.MarkMessagesSeenUpto(context.Background(), ack.ConversationID, client.UserID, ack.MessageID)
+		ctx := context.Background()
 
-		// 2. Sender-ke blue tick notify kora
-		h.SendDirect(ack.SenderID, EventStatusUpdated, map[string]any{
-			"conversation_id": ack.ConversationID,
-			"upto_message_id": ack.MessageID,
-			"status":          "seen",
-			"by_user":         client.UserID,
-		})
+		// ১. Messages টেবিলে রেঞ্জ সিন স্ট্যাটাস আপডেট
+		_ = h.chatRepo.MarkMessagesSeenUpto(ctx, ack.ConversationID, client.UserID, ack.MessageID)
+
+		// ২. conversation_members টেবিলে ওয়াটারমার্ক পয়েন্টার আপডেট
+		_ = h.chatRepo.UpdateLastReadWatermark(ctx, ack.ConversationID, client.UserID, ack.MessageID)
+
+		// ৩. প্রেরককে সরাসরি স্ট্যাটাস আপডেট পাঠানো (ডাবল ব্লু টিকের জন্য)[cite: 1, 2]
+		if ack.SenderID > 0 && ack.SenderID != client.UserID {
+			h.SendDirect(ack.SenderID, EventStatusUpdated, map[string]any{
+				"conversation_id": ack.ConversationID,
+				"upto_message_id": ack.MessageID,
+				"status":          "seen",
+				"by_user":         client.UserID,
+			})
+		}
+
+		// ৪. মেম্বারদের লাইভ বাবল ওয়াটারমার্ক ইভেন্ট ব্রডকাস্ট (Messenger অ্যাভাটার ভিউ)
+		userProfile, _ := h.userRepo.GetByID(ctx, client.UserID)
+		avatarURL := ""
+		userName := ""
+		if userProfile != nil {
+			userName = userProfile.Name
+			avatarURL = *userProfile.AvatarURL
+		}
+
+		members, err := h.chatRepo.GetConversationMemberIDs(ctx, ack.ConversationID)
+		if err != nil {
+			return
+		}
+
+		watermarkPayload := map[string]any{
+			"conversation_id":      ack.ConversationID,
+			"user_id":              client.UserID,
+			"user_name":            userName,
+			"user_avatar":          avatarURL,
+			"last_read_message_id": ack.MessageID,
+		}
+
+		for _, memberID := range members {
+			if memberID != client.UserID {
+				h.SendDirect(memberID, "member_read_watermark", watermarkPayload)
+			}
+		}
 
 	case EventCallOffer, EventCallAnswer, EventIceCandidate, EventCallEnd:
 		// WebRTC Signaling Forwarding

@@ -27,7 +27,7 @@ func main() {
 	chatSvc := service.NewChatService(chatRepo)
 
 	// 4. WebSocket Hub (Single Concurrency Goroutine)
-	hub := websocket.NewHub(chatRepo)
+	hub := websocket.NewHub(chatRepo, userRepo)
 	go hub.Run()
 
 	// 5. Handlers

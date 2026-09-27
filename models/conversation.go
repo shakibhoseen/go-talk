@@ -14,6 +14,7 @@ type Conversation struct {
 	ID                  string           `json:"id"`
 	Type                ConversationType `json:"type"`
 	Title               *string          `json:"title,omitempty"` // Group title
+	AvatarURL           *string          `json:"avatar_url,omitempty"`
 	LastMessageContent  *string          `json:"last_message_content,omitempty"`
 	LastMessageSenderID *int             `json:"last_message_sender_id,omitempty"`
 	LastMessageAt       *time.Time       `json:"last_message_at,omitempty"`
@@ -22,8 +23,9 @@ type Conversation struct {
 }
 
 type ConversationMember struct {
-	ConversationID string    `json:"conversation_id"`
-	UserID         int       `json:"user_id"`
-	Role           string    `json:"role"` // 'admin', 'member'
-	JoinedAt       time.Time `json:"joined_at"`
+	ConversationID    string    `json:"conversation_id"`
+	UserID            int       `json:"user_id"`
+	Role              string    `json:"role"` // 'admin', 'member'
+	LastReadMessageID int64     `json:"last_read_message_id"`
+	JoinedAt          time.Time `json:"joined_at"`
 }
