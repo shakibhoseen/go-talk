@@ -15,7 +15,8 @@ type AuthService interface {
 	Register(ctx context.Context, req *models.RegisterRequest) (*models.User, error)
 	Login(ctx context.Context, req *models.LoginRequest) (string, *models.User, error)
 	ValidateToken(tokenStr string) (int, error)
-	GetUserProfile(ctx context.Context, userID int) (*models.User, error) // Notun
+	GetUserProfile(ctx context.Context, userID int) (*models.User, error)
+	UpdateUserAvatar(ctx context.Context, userID int, avatarURL string) error
 }
 
 type authService struct {
@@ -111,4 +112,8 @@ func (s *authService) GetUserProfile(ctx context.Context, userID int) (*models.U
 	}
 	u.PasswordHash = "" // Security: Hash jeno json response-e na jay
 	return u, nil
+}
+
+func (s *authService) UpdateUserAvatar(ctx context.Context, userID int, avatarURL string) error {
+	return s.userRepo.UpdateAvatar(ctx, userID, avatarURL)
 }

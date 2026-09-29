@@ -110,16 +110,21 @@ func (r *chatRepo) GetUserConversations(ctx context.Context, userID int) ([]mode
 }
 
 func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, bool, error) {
+	// 1. Default limit set করা (যাতে কেউ একসাথে অনেক ডেটা রিকোয়েস্ট করে সার্ভার ডাউন না করতে পারে)
 	if limit <= 0 || limit > 50 {
 		limit = 20
 	}
 
-	// 1. Amra limit + 1 ta message query korbo ekta peek korar jonno
+	// 2. Pagination Peek: আমরা লিমিটের চেয়ে ১টি মেসেজ বেশি আনব (limit + 1)। 
+	// এই অতিরিক্ত মেসেজটি দিয়ে আমরা বুঝতে পারব যে ডেটাবেসে আরও পুরানো মেসেজ (Next Page) আছে কি না।
 	fetchLimit := limit + 1
 
 	var query string
 	var args []any
 
+	// 3. Query Optimization:
+	// আমরা সরাসরি JOIN না করে, আগে sub-query তে LIMIT অ্যাপ্লাই করেছি।
+	// এতে করে ডেটাবেসকে শুধু limit (যেমন 21) টা row এর সাথেই users টেবিল JOIN করতে হবে, যা অনেক ফাস্ট!
 	if beforeID > 0 {
 		query = `
 			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.message_type, sub.content, sub.created_at
@@ -166,13 +171,17 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, l
 	if err := rows.Err(); err != nil {
 		return nil, false, err
 	}
-	// 2. Jodi msgs.length > limit hoy, tar mane purono aro data ache!
+
+	// 4. HasMore (পরবর্তী পেজ) ক্যালকুলেশন
 	hasMore := false
 	if len(msgs) > limit {
 		hasMore = true
-		// ASC order-e thakar karone 0-index er shobcheye purono extra item-ti drop kore exact limit rakha
-		msgs = msgs[1:]
+		// কোয়েরিটি DESC (Descending) অর্ডারে ডেটা দিচ্ছে (সবচেয়ে নতুনটি শুরুতে)।
+		// তাই ১টি এক্সট্রা যে ডেটা এসেছিল সেটি আছে অ্যারের একদম শেষে।
+		// msgs[:limit] ব্যবহার করে আমরা অ্যারের শেষের সেই এক্সট্রা ডেটাটি বাদ দিয়ে দিচ্ছি।
+		msgs = msgs[:limit]
 	}
+	
 	return msgs, hasMore, nil
 }
 

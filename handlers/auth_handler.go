@@ -2,10 +2,15 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"go-talk/models"
 	"go-talk/service"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 )
 
 type AuthHandler struct {
@@ -80,3 +85,80 @@ func (h *AuthHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 		"user": user,
 	})
 }
+
+// POST /users/me/avatar
+func (h *AuthHandler) UploadAvatar(w http.ResponseWriter, r *http.Request) {
+	// 1. Authenticate user
+	authHeader := r.Header.Get("Authorization")
+	parts := strings.Split(authHeader, " ")
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	userID, err := h.authSvc.ValidateToken(parts[1])
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// 2. Parse multipart form (limit 5MB)
+	r.ParseMultipartForm(5 << 20)
+
+	// 3. Get the file from form
+	file, handler, err := r.FormFile("avatar")
+	if err != nil {
+		http.Error(w, "Failed to retrieve avatar file: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	// 4. Validate file extension (only allow images)
+	ext := strings.ToLower(filepath.Ext(handler.Filename))
+	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" {
+		http.Error(w, "Invalid file format. Only JPG and PNG are allowed.", http.StatusBadRequest)
+		return
+	}
+
+	// 5. Create directory if not exists
+	uploadDir := "uploads/profiles"
+	if err := os.MkdirAll(uploadDir, os.ModePerm); err != nil {
+		http.Error(w, "Failed to create upload directory", http.StatusInternalServerError)
+		return
+	}
+
+	// 6. Generate unique filename: avatar_{user_id}_{timestamp}.ext
+	filename := fmt.Sprintf("avatar_%d_%d%s", userID, time.Now().Unix(), ext)
+	filepath := filepath.Join(uploadDir, filename)
+
+	// 7. Save file locally
+	dst, err := os.Create(filepath)
+	if err != nil {
+		http.Error(w, "Failed to save file", http.StatusInternalServerError)
+		return
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, file); err != nil {
+		http.Error(w, "Failed to write file", http.StatusInternalServerError)
+		return
+	}
+
+	// 8. Generate public URL for the avatar
+	// You might want to build the base URL dynamically based on the server's domain/IP
+	avatarURL := fmt.Sprintf("/uploads/profiles/%s", filename)
+
+	// 9. Save to database
+	if err := h.authSvc.UpdateUserAvatar(r.Context(), userID, avatarURL); err != nil {
+		http.Error(w, "Failed to update database", http.StatusInternalServerError)
+		return
+	}
+
+	// 10. Return success
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"message":    "Avatar uploaded successfully",
+		"avatar_url": avatarURL,
+	})
+}
+

@@ -4,12 +4,15 @@ import (
 	"fmt"
 	"go-talk/config"
 	"go-talk/handlers"
+	"go-talk/middleware"
 	"go-talk/repository"
 	"go-talk/service"
 	"go-talk/websocket"
 	"log"
 	"net/http"
 )
+
+
 
 func main() {
 	cfg := config.LoadConfig()
@@ -40,6 +43,7 @@ func main() {
 	mux.HandleFunc("POST /auth/register", authHandler.Register)
 	mux.HandleFunc("POST /auth/login", authHandler.Login)
 	mux.HandleFunc("GET /users/me", authHandler.GetMe)
+	mux.HandleFunc("POST /users/me/avatar", authHandler.UploadAvatar)
 	mux.HandleFunc("GET /ws", wsHandler.Handle)
 
 	// Notun Chat REST Endpoints:
@@ -56,8 +60,12 @@ func main() {
 		w.Write([]byte("go-talk engine is healthy!"))
 	})
 
+	// Static file server for uploaded images
+	fs := http.FileServer(http.Dir("./uploads"))
+	mux.Handle("GET /uploads/", http.StripPrefix("/uploads/", fs))
+
 	fmt.Printf("🚀 go-talk server running on http://192.168.22.254%s\n", cfg.Port)
-	log.Fatal(http.ListenAndServe(cfg.Port, mux))
+	log.Fatal(http.ListenAndServe(cfg.Port, middleware.RecoverMiddleware(mux)))
 	// http.ListenAndServe(":8080", mux)
 	// ba
 	//log.Fatal(http.ListenAndServe("0.0.0.0:8080", mux))
