@@ -15,7 +15,7 @@ type ChatRepository interface {
 	GetUserConversations(ctx context.Context, userID int) ([]models.Conversation, error)
 
 	// Chat screen inside: Messages with pagination
-	GetConversationMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, error)
+	GetConversationMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, bool, error)
 
 	// Direct chat find or create helper
 	GetOrCreateDirectConversation(ctx context.Context, user1, user2 int) (string, error)
@@ -109,7 +109,14 @@ func (r *chatRepo) GetUserConversations(ctx context.Context, userID int) ([]mode
 	return convs, rows.Err()
 }
 
-func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, error) {
+func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, bool, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+
+	// 1. Amra limit + 1 ta message query korbo ekta peek korar jonno
+	fetchLimit := limit + 1
+
 	var query string
 	var args []any
 
@@ -125,7 +132,7 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, l
 			) sub
 			JOIN users u ON sub.sender_id = u.id
 			ORDER BY sub.id DESC`
-		args = []any{convID, beforeID, limit}
+		args = []any{convID, beforeID, fetchLimit}
 	} else {
 		query = `
 			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.message_type, sub.content, sub.created_at
@@ -138,12 +145,12 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, l
 			) sub
 			JOIN users u ON sub.sender_id = u.id
 			ORDER BY sub.id DESC`
-		args = []any{convID, limit}
+		args = []any{convID, fetchLimit}
 	}
 
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
 
@@ -151,15 +158,22 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, l
 	for rows.Next() {
 		var m models.Message
 		if err := rows.Scan(&m.ID, &m.ConversationID, &m.SenderID, &m.SenderName, &m.SenderAvatar, &m.MessageType, &m.Content, &m.CreatedAt); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		msgs = append(msgs, m)
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return msgs, nil
+	// 2. Jodi msgs.length > limit hoy, tar mane purono aro data ache!
+	hasMore := false
+	if len(msgs) > limit {
+		hasMore = true
+		// ASC order-e thakar karone 0-index er shobcheye purono extra item-ti drop kore exact limit rakha
+		msgs = msgs[1:]
+	}
+	return msgs, hasMore, nil
 }
 
 func (r *chatRepo) GetOrCreateDirectConversation(ctx context.Context, user1, user2 int) (string, error) {

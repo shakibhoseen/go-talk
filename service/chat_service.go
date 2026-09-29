@@ -10,7 +10,7 @@ type ChatService interface {
 	GetOrCreateDirectChat(ctx context.Context, currentUserID, targetUserID int) (string, error)
 	CreateGroupChat(ctx context.Context, title string, creatorID int, memberIDs []int) (string, error)
 	GetMyConversations(ctx context.Context, userID int) ([]models.Conversation, error)
-	GetChatMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, error)
+	GetChatMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, bool, error)
 	AddMemberToGroup(ctx context.Context, convID string, targetUserID int) error
 	RemoveMemberFromGroup(ctx context.Context, convID string, targetUserID int) error
 	UpdateLastReadWatermark(ctx context.Context, convID string, userID int, messageID int64) error
@@ -33,7 +33,7 @@ func (s *chatService) GetMyConversations(ctx context.Context, userID int) ([]mod
 	return s.chatRepo.GetUserConversations(ctx, userID)
 }
 
-func (s *chatService) GetChatMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, error) {
+func (s *chatService) GetChatMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, bool, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}

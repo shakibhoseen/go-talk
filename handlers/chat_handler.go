@@ -92,7 +92,7 @@ func (h *ChatHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	beforeID, _ := strconv.ParseInt(r.URL.Query().Get("before_id"), 10, 64)
 
-	messages, err := h.chatSvc.GetChatMessages(r.Context(), convID, limit, beforeID)
+	messages, hasMore, err := h.chatSvc.GetChatMessages(r.Context(), convID, limit, beforeID)
 	if err != nil {
 		http.Error(w, "Failed to fetch messages", http.StatusInternalServerError)
 		return
@@ -130,9 +130,18 @@ func (h *ChatHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	var nextBeforeID *int64 = nil
+	if len(messages) > 0 && hasMore {
+		// Chronological (ASC) list-e index 0 holo shobcheye purono message ID
+		oldestId := messages[len(messages)-1].ID
+		nextBeforeID = &oldestId
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"messages": responseList,
+		"messages":       responseList,
+		"has_more":       hasMore,
+		"next_before_id": nextBeforeID,
 	})
 }
 
