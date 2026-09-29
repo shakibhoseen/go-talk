@@ -178,12 +178,17 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 		}
 
 		// ৪. মেম্বারদের লাইভ বাবল ওয়াটারমার্ক ইভেন্ট ব্রডকাস্ট (Messenger অ্যাভাটার ভিউ)
-		userProfile, _ := h.userRepo.GetByID(ctx, client.UserID)
 		avatarURL := ""
 		userName := ""
-		if userProfile != nil {
-			userName = userProfile.Name
-			avatarURL = *userProfile.AvatarURL
+		if h.userRepo != nil {
+			userProfile, _ := h.userRepo.GetByID(ctx, client.UserID)
+			if userProfile != nil {
+				userName = userProfile.Name
+				// Safe pointer dereference (Nil check)
+				if userProfile.AvatarURL != nil {
+					avatarURL = *userProfile.AvatarURL
+				}
+			}
 		}
 
 		members, err := h.chatRepo.GetConversationMemberIDs(ctx, ack.ConversationID)
