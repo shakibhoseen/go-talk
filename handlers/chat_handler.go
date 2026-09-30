@@ -183,7 +183,7 @@ func (h *ChatHandler) CreateGroupChat(w http.ResponseWriter, r *http.Request) {
 
 // POST /conversations/{id}/members
 func (h *ChatHandler) AddMember(w http.ResponseWriter, r *http.Request) {
-	_, err := h.extractUserID(r)
+	userID, err := h.extractUserID(r)
 	if err != nil {
 		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
@@ -203,7 +203,7 @@ func (h *ChatHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.chatSvc.AddMemberToGroup(r.Context(), convID, req.TargetUserID); err != nil {
+	if err := h.chatSvc.AddMemberToGroup(r.Context(), convID, req.TargetUserID, userID); err != nil {
 		http.Error(w, "Failed to add member: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -239,4 +239,55 @@ func (h *ChatHandler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{
 		"message": "Member removed successfully",
 	})
+}
+
+func (h *ChatHandler) UpdateGroupAvatar(w http.ResponseWriter, r *http.Request) {
+	userID, err := h.extractUserID(r)
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	convID := r.PathValue("id")
+	if convID == "" {
+		http.Error(w, "Missing conversation id", http.StatusBadRequest)
+		return
+	}
+
+	var req models.UpdateGroupAvatarRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.chatSvc.UpdateGroupAvatar(r.Context(), convID, req.AvatarURL, userID); err != nil {
+		http.Error(w, "Failed to update avatar: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"message": "Group avatar updated successfully"})
+}
+
+func (h *ChatHandler) GetConversationMembers(w http.ResponseWriter, r *http.Request) {
+	userID, err := h.extractUserID(r)
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	convID := r.PathValue("id")
+	if convID == "" {
+		http.Error(w, "Missing conversation id", http.StatusBadRequest)
+		return
+	}
+
+	members, err := h.chatSvc.GetConversationMembers(r.Context(), convID, userID)
+	if err != nil {
+		http.Error(w, "Failed to get members: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(members)
 }

@@ -58,6 +58,9 @@ func main() {
 	mux.HandleFunc("POST /conversations/group", chatHandler.CreateGroupChat)
 
 	mux.HandleFunc("POST /conversations/{id}/members", chatHandler.AddMember)
+	mux.HandleFunc("PUT /conversations/{id}/avatar", chatHandler.UpdateGroupAvatar)
+	mux.HandleFunc("GET /conversations/{id}/members", chatHandler.GetConversationMembers)
+
 	mux.HandleFunc("DELETE /conversations/{id}/members/{user_id}", chatHandler.RemoveMember)
 
 	// Health check endpoint
