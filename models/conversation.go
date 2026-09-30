@@ -29,3 +29,22 @@ type ConversationMember struct {
 	LastReadMessageID int64     `json:"last_read_message_id"`
 	JoinedAt          time.Time `json:"joined_at"`
 }
+
+type ConversationMemberProfile struct {
+	ConversationID string    `json:"conversation_id"`
+	UserID         int       `json:"user_id"`
+	Role           string    `json:"role"`
+	JoinedAt       time.Time `json:"joined_at"`
+	Name           string    `json:"name"`
+	Email          string    `json:"email"`
+	AvatarURL      *string   `json:"avatar_url,omitempty"`
+}
+
+type UpdateGroupAvatarRequest struct {
+	AvatarURL string `json:"avatar_url"`
+}
+
+type AddGroupMemberRequest struct {
+	UserID int    `json:"user_id"`
+	Role   string `json:"role"` // default "member"
+}

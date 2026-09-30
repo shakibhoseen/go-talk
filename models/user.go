@@ -13,18 +13,8 @@ type User struct {
 	Email        string    `json:"email"`
 	PasswordHash string    `json:"-"`
 	AvatarURL    *string   `json:"avatar_url,omitempty"`
+	Bio          *string   `json:"bio,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
-}
-
-type RegisterRequest struct {
-	Name     string `json:"name"`
-	Email    string `json:"email"`
-	Password string `json:"password"`
-}
-
-type LoginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
 }
 
 func (r *RegisterRequest) Validate() error {
@@ -40,4 +30,12 @@ func (r *RegisterRequest) Validate() error {
 		return errors.New("password must be at least 6 characters")
 	}
 	return nil
+}
+
+type UpdateNameRequest struct {
+	Name string `json:"name"`
+}
+
+type UpdateBioRequest struct {
+	Bio string `json:"bio"`
 }

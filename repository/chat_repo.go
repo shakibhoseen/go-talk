@@ -8,6 +8,9 @@ import (
 )
 
 type ChatRepository interface {
+	UpdateGroupAvatar(ctx context.Context, convID string, avatarURL string) error
+	GetConversationMembers(ctx context.Context, convID string) ([]models.ConversationMemberProfile, error)
+	GetUserRoleInConversation(ctx context.Context, convID string, userID int) (string, error)
 	// ACID Transaction: Inserts message and atomically updates conversation head
 	SaveMessage(ctx context.Context, msg *models.Message) error
 
@@ -369,4 +372,55 @@ func (r *chatRepo) GetGroupReadWatermarks(ctx context.Context, convID string) (m
 	}
 
 	return watermarks, nil
+}
+
+func (r *chatRepo) UpdateGroupAvatar(ctx context.Context, convID string, avatarURL string) error {
+	query := `UPDATE conversations SET avatar_url = $1 WHERE id = $2 AND type = 'group'`
+	res, err := r.db.ExecContext(ctx, query, avatarURL, convID)
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return errors.New("group not found or not a group")
+	}
+	return nil
+}
+
+func (r *chatRepo) GetConversationMembers(ctx context.Context, convID string) ([]models.ConversationMemberProfile, error) {
+	query := `
+		SELECT cm.conversation_id, cm.user_id, cm.role, cm.joined_at, u.name, u.email, u.avatar_url
+		FROM conversation_members cm
+		JOIN users u ON cm.user_id = u.id
+		WHERE cm.conversation_id = $1
+		ORDER BY cm.role ASC, u.name ASC
+	`
+	rows, err := r.db.QueryContext(ctx, query, convID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []models.ConversationMemberProfile
+	for rows.Next() {
+		var m models.ConversationMemberProfile
+		if err := rows.Scan(&m.ConversationID, &m.UserID, &m.Role, &m.JoinedAt, &m.Name, &m.Email, &m.AvatarURL); err != nil {
+			return nil, err
+		}
+		members = append(members, m)
+	}
+	return members, nil
+}
+
+func (r *chatRepo) GetUserRoleInConversation(ctx context.Context, convID string, userID int) (string, error) {
+	query := `SELECT role FROM conversation_members WHERE conversation_id = $1 AND user_id = $2`
+	var role string
+	err := r.db.QueryRowContext(ctx, query, convID, userID).Scan(&role)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", errors.New("user is not a member of this conversation")
+		}
+		return "", err
+	}
+	return role, nil
 }

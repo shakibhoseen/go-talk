@@ -5,14 +5,13 @@ import (
 	"go-talk/config"
 	"go-talk/handlers"
 	"go-talk/middleware"
+	"go-talk/pkg/token"
 	"go-talk/repository"
 	"go-talk/service"
 	"go-talk/websocket"
 	"log"
 	"net/http"
 )
-
-
 
 func main() {
 	cfg := config.LoadConfig()
@@ -25,8 +24,10 @@ func main() {
 	userRepo := repository.NewUserRepository(db)
 	chatRepo := repository.NewChatRepository(db)
 
+	tokenMaker, _ := token.NewJWTMaker(cfg.JWTSecret)
+
 	// 3. Services
-	authSvc := service.NewAuthService(userRepo, cfg.JWTSecret)
+	authSvc := service.NewAuthService(userRepo, tokenMaker)
 	chatSvc := service.NewChatService(chatRepo)
 
 	// 4. WebSocket Hub (Single Concurrency Goroutine)
@@ -42,7 +43,11 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /auth/register", authHandler.Register)
 	mux.HandleFunc("POST /auth/login", authHandler.Login)
+	mux.HandleFunc("POST /auth/refresh", authHandler.RefreshToken) // নতুন
+	mux.HandleFunc("POST /auth/logout", authHandler.Logout)        // নতুন
 	mux.HandleFunc("GET /users/me", authHandler.GetMe)
+	mux.HandleFunc("PUT /users/me/name", authHandler.UpdateName)
+	mux.HandleFunc("PUT /users/me/bio", authHandler.UpdateBio)
 	mux.HandleFunc("POST /users/me/avatar", authHandler.UploadAvatar)
 	mux.HandleFunc("GET /ws", wsHandler.Handle)
 

@@ -46,17 +46,14 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, user, err := h.authSvc.Login(r.Context(), &req)
+	authResponse, err := h.authSvc.Login(r.Context(), &req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"token": token,
-		"user":  user,
-	})
+	json.NewEncoder(w).Encode(authResponse)
 }
 
 // GET /users/me
@@ -162,3 +159,100 @@ func (h *AuthHandler) UploadAvatar(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// POST /auth/refresh
+func (h *AuthHandler) RefreshToken(w http.ResponseWriter, r *http.Request) {
+	var req models.RefreshRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	authResponse, err := h.authSvc.RefreshToken(r.Context(), &req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(authResponse)
+}
+
+// POST /auth/logout
+func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	var req models.RefreshRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	err := h.authSvc.Logout(r.Context(), &req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "logged out successfully"})
+}
+
+// PUT /users/me/name
+func (h *AuthHandler) UpdateName(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	parts := strings.Split(authHeader, " ")
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	userID, err := h.authSvc.ValidateToken(parts[1])
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	var req models.UpdateNameRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	if strings.TrimSpace(req.Name) == "" {
+		http.Error(w, "Name cannot be empty", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.authSvc.UpdateUserName(r.Context(), userID, req.Name); err != nil {
+		http.Error(w, "Failed to update name", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Name updated successfully"})
+}
+
+// PUT /users/me/bio
+func (h *AuthHandler) UpdateBio(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	parts := strings.Split(authHeader, " ")
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	userID, err := h.authSvc.ValidateToken(parts[1])
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	var req models.UpdateBioRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.authSvc.UpdateUserBio(r.Context(), userID, req.Bio); err != nil {
+		http.Error(w, "Failed to update bio", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Bio updated successfully"})
+}
