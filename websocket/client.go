@@ -3,6 +3,7 @@ package websocket
 import (
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -24,10 +25,13 @@ var upgrader = websocket.Upgrader{
 }
 
 type Client struct {
-	Hub    *Hub
-	Conn   *websocket.Conn
-	send   chan []byte
-	UserID int
+	Hub       *Hub
+	Conn      *websocket.Conn
+	send      chan []byte
+	closeOnce sync.Once // Guards close(send) so it's only called once
+	UserID    int
+	UserName  string // Cached at connect time — avoids DB fetch on every ack_seen
+	AvatarURL string // Cached at connect time
 }
 
 func (c *Client) ReadPump() {
@@ -61,6 +65,8 @@ func (c *Client) WritePump() {
 	defer func() {
 		ticker.Stop()
 		c.Conn.Close()
+		// Ensure Hub cleanup happens if WritePump exits (e.g. write deadline exceeded)
+		c.Hub.unregister <- c
 	}()
 
 	for {
@@ -99,7 +105,7 @@ func (c *Client) WritePump() {
 	}
 }
 
-func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request, userID int) {
+func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request, userID int, userName string, avatarURL string) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("WebSocket upgrade failed:", err)
@@ -107,10 +113,12 @@ func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request, userID int) {
 	}
 
 	client := &Client{
-		Hub:    hub,
-		Conn:   conn,
-		send:   make(chan []byte, 256),
-		UserID: userID,
+		Hub:       hub,
+		Conn:      conn,
+		send:      make(chan []byte, 512), // Increased from 256 to handle large groups
+		UserID:    userID,
+		UserName:  userName,
+		AvatarURL: avatarURL,
 	}
 	client.Hub.register <- client
 

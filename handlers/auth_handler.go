@@ -100,7 +100,11 @@ func (h *AuthHandler) UploadAvatar(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Parse multipart form (limit 5MB)
-	r.ParseMultipartForm(5 << 20)
+	r.Body = http.MaxBytesReader(w, r.Body, 5<<20)
+	if err := r.ParseMultipartForm(5 << 20); err != nil {
+		http.Error(w, "File too large. Maximum size is 5MB.", http.StatusBadRequest)
+		return
+	}
 
 	// 3. Get the file from form
 	file, handler, err := r.FormFile("avatar")

@@ -1,6 +1,11 @@
 package handlers
 
 import (
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"time"
 	"encoding/json"
 	"go-talk/models"
 	"go-talk/service"
@@ -111,13 +116,19 @@ func (h *ChatHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
 	responseList := make([]models.MessageWithReceipts, 0, len(messages))
 	for _, m := range messages {
 		users := watermarks[m.ID]
+		var filteredUsers []models.ReadReceiptUser
+		for _, u := range users {
+			if u.UserID != m.SenderID {
+				filteredUsers = append(filteredUsers, u)
+			}
+		}
 
 		var visibleUsers []models.ReadReceiptUser
-		totalRead := len(users)
+		totalRead := len(filteredUsers)
 
-		if totalRead > maxVisibleAvatars {
+		if len(users) > maxVisibleAvatars {
 			visibleUsers = users[:maxVisibleAvatars]
-		} else if totalRead > 0 {
+		} else if len(users) > 0 {
 			visibleUsers = users
 		} else {
 			visibleUsers = []models.ReadReceiptUser{}
@@ -126,7 +137,7 @@ func (h *ChatHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
 		responseList = append(responseList, models.MessageWithReceipts{
 			Message:   m,
 			ReadBy:    visibleUsers,
-			ReadCount: totalRead, // Flutter-e "+97" dekhate
+			ReadCount: totalRead, // Flutter-e "+97" dekhate (excluding sender)
 		})
 	}
 
@@ -254,19 +265,58 @@ func (h *ChatHandler) UpdateGroupAvatar(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var req models.UpdateGroupAvatarRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+	// Parse multipart form (limit 5MB)
+	r.Body = http.MaxBytesReader(w, r.Body, 5<<20)
+	if err := r.ParseMultipartForm(5 << 20); err != nil {
+		http.Error(w, "File too large. Maximum size is 5MB.", http.StatusBadRequest)
+		return
+	}
+	file, handler, err := r.FormFile("avatar")
+	if err != nil {
+		http.Error(w, "Failed to retrieve avatar file: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	ext := strings.ToLower(filepath.Ext(handler.Filename))
+	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" {
+		http.Error(w, "Invalid file format. Only JPG and PNG are allowed.", http.StatusBadRequest)
 		return
 	}
 
-	if err := h.chatSvc.UpdateGroupAvatar(r.Context(), convID, req.AvatarURL, userID); err != nil {
+	uploadDir := "uploads/groups"
+	if err := os.MkdirAll(uploadDir, os.ModePerm); err != nil {
+		http.Error(w, "Failed to create upload directory", http.StatusInternalServerError)
+		return
+	}
+
+	filename := fmt.Sprintf("group_%s_%d%s", convID, time.Now().Unix(), ext)
+	filePath := filepath.Join(uploadDir, filename)
+
+	dst, err := os.Create(filePath)
+	if err != nil {
+		http.Error(w, "Failed to save file", http.StatusInternalServerError)
+		return
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, file); err != nil {
+		http.Error(w, "Failed to write file", http.StatusInternalServerError)
+		return
+	}
+
+	avatarURL := fmt.Sprintf("/uploads/groups/%s", filename)
+
+	if err := h.chatSvc.UpdateGroupAvatar(r.Context(), convID, avatarURL, userID); err != nil {
 		http.Error(w, "Failed to update avatar: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"message": "Group avatar updated successfully"})
+	json.NewEncoder(w).Encode(map[string]any{
+		"message": "Group avatar updated successfully",
+		"avatar_url": avatarURL,
+	})
 }
 
 func (h *ChatHandler) GetConversationMembers(w http.ResponseWriter, r *http.Request) {

@@ -6,11 +6,13 @@ import (
 	"go-talk/models"
 	"go-talk/repository"
 	"log"
+	"sync"
 )
 
 type Hub struct {
 	// Registered clients: userID -> map of active client connections (for multi-device support)
 	clients    map[int]map[*Client]bool
+	mu         sync.RWMutex // Protects h.clients from concurrent read/write panics
 	broadcast  chan []byte
 	register   chan *Client
 	unregister chan *Client
@@ -33,41 +35,50 @@ func (h *Hub) Run() {
 	for {
 		select {
 		case client := <-h.register:
+			h.mu.Lock()
 			if _, ok := h.clients[client.UserID]; !ok {
 				h.clients[client.UserID] = make(map[*Client]bool)
 			}
 			h.clients[client.UserID][client] = true
+			h.mu.Unlock()
 			log.Printf("User %d connected. Total sessions for user: %d\n", client.UserID, len(h.clients[client.UserID]))
 
 		case client := <-h.unregister:
+			h.mu.Lock()
 			if userConns, ok := h.clients[client.UserID]; ok {
 				if _, exists := userConns[client]; exists {
 					delete(userConns, client)
-					close(client.send)
+					// Guard against double-close: only close if not already closed
+					client.closeOnce.Do(func() { close(client.send) })
 					if len(userConns) == 0 {
 						delete(h.clients, client.UserID)
 					}
 					log.Printf("User %d disconnected\n", client.UserID)
 				}
 			}
+			h.mu.Unlock()
 
 		case message := <-h.broadcast:
 			// Global broadcast (used for system maintenance announcements)
+			h.mu.Lock()
 			for _, userConns := range h.clients {
 				for client := range userConns {
 					select {
 					case client.send <- message:
 					default:
-						close(client.send)
+						// Slow client — remove and close safely
 						delete(userConns, client)
+						client.closeOnce.Do(func() { close(client.send) })
 					}
 				}
 			}
+			h.mu.Unlock()
 		}
 	}
 }
 
-// SendDirect pushes an event to a specific target user (across all their active devices)
+// SendDirect pushes an event to a specific target user (across all their active devices).
+// Safe to call from any goroutine.
 func (h *Hub) SendDirect(targetUserID int, eventType EventType, payload any) {
 	bytes, err := json.Marshal(payload)
 	if err != nil {
@@ -79,14 +90,33 @@ func (h *Hub) SendDirect(targetUserID int, eventType EventType, payload any) {
 		Payload: bytes,
 	})
 
-	if userConns, ok := h.clients[targetUserID]; ok {
-		for client := range userConns {
-			select {
-			case client.send <- envelope:
-			default:
-				close(client.send)
-				delete(userConns, client)
+	h.mu.RLock()
+	userConns, ok := h.clients[targetUserID]
+	if !ok {
+		h.mu.RUnlock()
+		return
+	}
+	// Snapshot the client set so we can release the read lock before touching channels
+	targets := make([]*Client, 0, len(userConns))
+	for client := range userConns {
+		targets = append(targets, client)
+	}
+	h.mu.RUnlock()
+
+	for _, client := range targets {
+		select {
+		case client.send <- envelope:
+		default:
+			// Slow client — upgrade to write lock to remove it safely
+			h.mu.Lock()
+			if userConns2, ok2 := h.clients[targetUserID]; ok2 {
+				delete(userConns2, client)
+				client.closeOnce.Do(func() { close(client.send) })
+				if len(userConns2) == 0 {
+					delete(h.clients, targetUserID)
+				}
 			}
+			h.mu.Unlock()
 		}
 	}
 }
@@ -164,10 +194,10 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 		// ১. Messages টেবিলে রেঞ্জ সিন স্ট্যাটাস আপডেট
 		_ = h.chatRepo.MarkMessagesSeenUpto(ctx, ack.ConversationID, client.UserID, ack.MessageID)
 
-		// ২. conversation_members টেবিলে ওয়াটারমার্ক পয়েন্টার আপডেট
+		// ২. conversation_members টেবিলে ওয়াটারমার্ক পয়েন্টার আপডেট
 		_ = h.chatRepo.UpdateLastReadWatermark(ctx, ack.ConversationID, client.UserID, ack.MessageID)
 
-		// ৩. প্রেরককে সরাসরি স্ট্যাটাস আপডেট পাঠানো (ডাবল ব্লু টিকের জন্য)[cite: 1, 2]
+		// ৩. প্রেরককে সরাসরি স্ট্যাটাস আপডেট পাঠানো (ডাবল ব্লু টিকের জন্য)
 		if ack.SenderID > 0 && ack.SenderID != client.UserID {
 			h.SendDirect(ack.SenderID, EventStatusUpdated, map[string]any{
 				"conversation_id": ack.ConversationID,
@@ -177,20 +207,8 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			})
 		}
 
-		// ৪. মেম্বারদের লাইভ বাবল ওয়াটারমার্ক ইভেন্ট ব্রডকাস্ট (Messenger অ্যাভাটার ভিউ)
-		avatarURL := ""
-		userName := ""
-		if h.userRepo != nil {
-			userProfile, _ := h.userRepo.GetByID(ctx, client.UserID)
-			if userProfile != nil {
-				userName = userProfile.Name
-				// Safe pointer dereference (Nil check)
-				if userProfile.AvatarURL != nil {
-					avatarURL = *userProfile.AvatarURL
-				}
-			}
-		}
-
+		// ৪. মেম্বারদের লাইভ বাবল ওয়াটারমার্ক ইভেন্ট ব্রডকাস্ট
+		// User profile is cached in the Client struct at connect time — no extra DB call!
 		members, err := h.chatRepo.GetConversationMemberIDs(ctx, ack.ConversationID)
 		if err != nil {
 			return
@@ -199,8 +217,8 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 		watermarkPayload := map[string]any{
 			"conversation_id":      ack.ConversationID,
 			"user_id":              client.UserID,
-			"user_name":            userName,
-			"user_avatar":          avatarURL,
+			"user_name":            client.UserName,   // cached at connect time
+			"user_avatar":          client.AvatarURL,  // cached at connect time
 			"last_read_message_id": ack.MessageID,
 		}
 

@@ -19,6 +19,7 @@ type Conversation struct {
 	LastMessageSenderID *int             `json:"last_message_sender_id,omitempty"`
 	LastMessageAt       *time.Time       `json:"last_message_at,omitempty"`
 	UnreadCount         int              `json:"unread_count"`
+	OtherUserID         *int             `json:"other_user_id,omitempty"`
 	CreatedAt           time.Time        `json:"created_at"`
 }
 

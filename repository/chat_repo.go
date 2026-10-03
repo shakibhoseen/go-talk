@@ -72,6 +72,14 @@ func (r *chatRepo) SaveMessage(ctx context.Context, msg *models.Message) error {
 		return err
 	}
 
+	// 3. Auto-update sender's own read watermark to the message they just sent!
+	watermarkQuery := `UPDATE conversation_members
+					   SET last_read_message_id = $1
+					   WHERE conversation_id = $2 AND user_id = $3`
+	_, err = tx.ExecContext(ctx, watermarkQuery, msg.ID, msg.ConversationID, msg.SenderID)
+	if err != nil {
+		return err
+	}
 	rows, err := res.RowsAffected()
 	if err != nil || rows == 0 {
 		return errors.New("conversation head not found to update")
@@ -83,9 +91,20 @@ func (r *chatRepo) SaveMessage(ctx context.Context, msg *models.Message) error {
 
 func (r *chatRepo) GetUserConversations(ctx context.Context, userID int) ([]models.Conversation, error) {
 	// Chat List query: 50 chats load instantly because data is pre-cached on conversations table
-	query := `SELECT c.id, c.type, c.title, c.last_message_content, c.last_message_sender_id, c.last_message_at, c.created_at
+	query := `SELECT 
+				c.id, 
+				c.type, 
+				CASE WHEN c.type = 'direct' THEN u2.name ELSE c.title END as title,
+				CASE WHEN c.type = 'direct' THEN u2.avatar_url ELSE c.avatar_url END as avatar_url,
+				c.last_message_content, 
+				c.last_message_sender_id, 
+				c.last_message_at, 
+				CASE WHEN c.type = 'direct' THEN u2.id ELSE NULL END as other_user_id,
+				c.created_at
 	          FROM conversations c
 	          INNER JOIN conversation_members cm ON c.id = cm.conversation_id
+			  LEFT JOIN conversation_members cm2 ON c.id = cm2.conversation_id AND c.type = 'direct' AND cm2.user_id != $1
+			  LEFT JOIN users u2 ON cm2.user_id = u2.id
 	          WHERE cm.user_id = $1
 	          ORDER BY COALESCE(c.last_message_at, c.created_at) DESC
 	          LIMIT 50`
@@ -100,9 +119,9 @@ func (r *chatRepo) GetUserConversations(ctx context.Context, userID int) ([]mode
 	for rows.Next() {
 		var c models.Conversation
 		if err := rows.Scan(
-			&c.ID, &c.Type, &c.Title,
+			&c.ID, &c.Type, &c.Title, &c.AvatarURL,
 			&c.LastMessageContent, &c.LastMessageSenderID, &c.LastMessageAt,
-			&c.CreatedAt,
+			&c.OtherUserID, &c.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -346,10 +365,14 @@ func (r *chatRepo) UpdateLastReadWatermark(ctx context.Context, convID string, u
 // GetGroupReadWatermarks: কোন মেসেজ আইডিতে কোন কোন ইউজার অবস্থান করছে তা রিটার্ন করে
 func (r *chatRepo) GetGroupReadWatermarks(ctx context.Context, convID string) (map[int64][]models.ReadReceiptUser, error) {
 	query := `
-		SELECT cm.last_read_message_id, u.id, u.name, COALESCE(u.avatar_url, '')
+		SELECT GREATEST(cm.last_read_message_id, COALESCE(MAX(m.id), 0)) AS msg_id,
+		       u.id, u.name, COALESCE(u.avatar_url, '')
 		FROM conversation_members cm
 		JOIN users u ON cm.user_id = u.id
-		WHERE cm.conversation_id = $1 AND cm.last_read_message_id > 0`
+		LEFT JOIN messages m ON m.conversation_id = cm.conversation_id AND m.sender_id = u.id
+		WHERE cm.conversation_id = $1
+		GROUP BY cm.last_read_message_id, u.id, u.name, u.avatar_url
+		HAVING GREATEST(cm.last_read_message_id, COALESCE(MAX(m.id), 0)) > 0`
 
 	rows, err := r.db.QueryContext(ctx, query, convID)
 	if err != nil {

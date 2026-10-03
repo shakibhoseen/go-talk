@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"go-talk/service"
 	"go-talk/websocket"
 	"net/http"
@@ -28,6 +29,16 @@ func (h *WSHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fetch user profile ONCE at connect time so the Hub never needs to DB-fetch on each ack
+	userName := ""
+	avatarURL := ""
+	if profile, err := h.authSvc.GetUserProfile(context.Background(), userID); err == nil && profile != nil {
+		userName = profile.Name
+		if profile.AvatarURL != nil {
+			avatarURL = *profile.AvatarURL
+		}
+	}
+
 	// Upgrade HTTP connection to duplex WebSocket with authenticated user ID
-	websocket.ServeWs(h.hub, w, r, userID)
+	websocket.ServeWs(h.hub, w, r, userID, userName, avatarURL)
 }
