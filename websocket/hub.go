@@ -173,6 +173,16 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			}
 		}
 
+		// গ্রুপে অন্য ইউজারদের কাছে মেসেজ পাঠানো মাত্রই সেন্ডারের জন্য delivered স্ট্যাটাস পাঠানো
+		if len(members) > 1 {
+			_ = h.chatRepo.MarkMessageDelivered(ctx, msg.ID, client.UserID)
+			h.SendDirect(client.UserID, EventStatusUpdated, map[string]any{
+				"conversation_id": p.ConversationID,
+				"upto_message_id": msg.ID,
+				"status":          "delivered",
+			})
+		}
+
 	case EventAckDelivered:
 		var ack AckPayload
 		if err := json.Unmarshal(event.Payload, &ack); err != nil {
@@ -204,18 +214,7 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 		// ২. conversation_members টেবিলে ওয়াটারমার্ক পয়েন্টার আপডেট
 		_ = h.chatRepo.UpdateLastReadWatermark(ctx, ack.ConversationID, client.UserID, ack.MessageID)
 
-		// ৩. প্রেরককে সরাসরি স্ট্যাটাস আপডেট পাঠানো (ডাবল ব্লু টিকের জন্য)
-		if ack.SenderID > 0 && ack.SenderID != client.UserID {
-			h.SendDirect(ack.SenderID, EventStatusUpdated, map[string]any{
-				"conversation_id": ack.ConversationID,
-				"upto_message_id": ack.MessageID,
-				"status":          "seen",
-				"by_user":         client.UserID,
-			})
-		}
-
-		// ৪. মেম্বারদের লাইভ বাবল ওয়াটারমার্ক ইভেন্ট ব্রডকাস্ট
-		// User profile is cached in the Client struct at connect time — no extra DB call!
+		// ৩. মেম্বারদের লাইভ বাবল ও সিন স্ট্যাটাস ব্রডকাস্ট
 		members, err := h.chatRepo.GetConversationMemberIDs(ctx, ack.ConversationID)
 		if err != nil {
 			return
@@ -231,6 +230,12 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 
 		for _, memberID := range members {
 			if memberID != client.UserID {
+				h.SendDirect(memberID, EventStatusUpdated, map[string]any{
+					"conversation_id": ack.ConversationID,
+					"upto_message_id": ack.MessageID,
+					"status":          "seen",
+					"by_user":         client.UserID,
+				})
 				h.SendDirect(memberID, "member_read_watermark", watermarkPayload)
 			}
 		}
