@@ -103,42 +103,40 @@ func (h *ChatHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var minMessageID int64 = 0
+	if len(messages) > 0 {
+		minMessageID = messages[len(messages)-1].ID
+	}
+
 	// ২. মেম্বারদের ওয়াটারমার্ক (কার কতটুকু দেখা শেষ) ফেচ করা (নতুন মেথড)
-	watermarks, err := h.chatSvc.GetGroupReadWatermarks(r.Context(), convID)
+	watermarks, err := h.chatSvc.GetGroupReadWatermarks(r.Context(), convID, minMessageID)
 	if err != nil {
 		// এরর হলে খালি ম্যাপ ধরে প্রসেস করবে যাতে এপিআই ফেইল না করে
 		watermarks = make(map[int64][]models.ReadReceiptUser)
 	}
 
-	// handlers/chat_handler.go
 	const maxVisibleAvatars = 3
-	// ৩. মেসেজের সাথে ReadBy ইউজার তালিকা এটাচ করে ফাইনাল রেসপন্স লিস্ট বানানো
-	responseList := make([]models.MessageWithReceipts, 0, len(messages))
+	watermarkMap := make(map[string]models.MessageWatermark)
+
 	for _, m := range messages {
 		users := watermarks[m.ID]
-		var filteredUsers []models.ReadReceiptUser
-		for _, u := range users {
-			if u.UserID != m.SenderID {
-				filteredUsers = append(filteredUsers, u)
-			}
+		totalRead := len(users)
+
+		if totalRead == 0 {
+			continue
 		}
 
 		var visibleUsers []models.ReadReceiptUser
-		totalRead := len(filteredUsers)
-
-		if len(users) > maxVisibleAvatars {
+		if totalRead > maxVisibleAvatars {
 			visibleUsers = users[:maxVisibleAvatars]
-		} else if len(users) > 0 {
-			visibleUsers = users
 		} else {
-			visibleUsers = []models.ReadReceiptUser{}
+			visibleUsers = users
 		}
 
-		responseList = append(responseList, models.MessageWithReceipts{
-			Message:   m,
-			ReadBy:    visibleUsers,
-			ReadCount: totalRead, // Flutter-e "+97" dekhate (excluding sender)
-		})
+		watermarkMap[strconv.FormatInt(m.ID, 10)] = models.MessageWatermark{
+			Users: visibleUsers,
+			Count: totalRead,
+		}
 	}
 
 	var nextBeforeID *int64 = nil
@@ -150,7 +148,8 @@ func (h *ChatHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"messages":       responseList,
+		"messages":       messages,
+		"watermarks":     watermarkMap,
 		"has_more":       hasMore,
 		"next_before_id": nextBeforeID,
 	})

@@ -34,7 +34,7 @@ type ChatRepository interface {
 	RemoveGroupMember(ctx context.Context, convID string, userID int) error
 
 	UpdateLastReadWatermark(ctx context.Context, convID string, userID int, messageID int64) error
-	GetGroupReadWatermarks(ctx context.Context, convID string) (map[int64][]models.ReadReceiptUser, error)
+	GetGroupReadWatermarks(ctx context.Context, convID string, minMessageID int64) (map[int64][]models.ReadReceiptUser, error)
 }
 
 type chatRepo struct {
@@ -363,18 +363,17 @@ func (r *chatRepo) UpdateLastReadWatermark(ctx context.Context, convID string, u
 }
 
 // GetGroupReadWatermarks: কোন মেসেজ আইডিতে কোন কোন ইউজার অবস্থান করছে তা রিটার্ন করে
-func (r *chatRepo) GetGroupReadWatermarks(ctx context.Context, convID string) (map[int64][]models.ReadReceiptUser, error) {
+// minMessageID > 0 হলে শুধুমাত্র বর্তমান পেজের মেসেজ রেঞ্জের অ্যাক্টিভ ওয়াটারমার্কগুলো ফেচ করবে (Viewport Optimization)
+func (r *chatRepo) GetGroupReadWatermarks(ctx context.Context, convID string, minMessageID int64) (map[int64][]models.ReadReceiptUser, error) {
 	query := `
-		SELECT GREATEST(cm.last_read_message_id, COALESCE(MAX(m.id), 0)) AS msg_id,
+		SELECT cm.last_read_message_id AS msg_id,
 		       u.id, u.name, COALESCE(u.avatar_url, '')
 		FROM conversation_members cm
 		JOIN users u ON cm.user_id = u.id
-		LEFT JOIN messages m ON m.conversation_id = cm.conversation_id AND m.sender_id = u.id
 		WHERE cm.conversation_id = $1
-		GROUP BY cm.last_read_message_id, u.id, u.name, u.avatar_url
-		HAVING GREATEST(cm.last_read_message_id, COALESCE(MAX(m.id), 0)) > 0`
+		  AND cm.last_read_message_id >= $2`
 
-	rows, err := r.db.QueryContext(ctx, query, convID)
+	rows, err := r.db.QueryContext(ctx, query, convID, minMessageID)
 	if err != nil {
 		return nil, err
 	}

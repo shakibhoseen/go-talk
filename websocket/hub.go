@@ -139,15 +139,22 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 		msg := &models.Message{
 			ConversationID: p.ConversationID,
 			SenderID:       client.UserID,
+			SenderName:     client.UserName,
+			SenderAvatar:   client.AvatarURL,
 			MessageType:    models.MessageType(p.MessageType),
 			Content:        p.Content,
 		}
 
+		ctx := context.Background()
+
 		// ১. ডেটাবেসে মেসেজ ও লাস্ট মেসেজ সেভ
-		if err := h.chatRepo.SaveMessage(context.Background(), msg); err != nil {
+		if err := h.chatRepo.SaveMessage(ctx, msg); err != nil {
 			log.Println("Failed to save message:", err)
 			return
 		}
+
+		// সেন্ডারের নিজের ওয়াটারমার্কও তাৎক্ষণিকভাবে এই মেসেজে আপডেট করা
+		_ = h.chatRepo.UpdateLastReadWatermark(ctx, p.ConversationID, client.UserID, msg.ID)
 
 		// ২. প্রেরককে 'Sent' স্ট্যাটাস হিসেবে পাঠানো
 		h.SendDirect(client.UserID, EventNewMessage, msg)

@@ -17,7 +17,7 @@ type ChatService interface {
 	GetConversationMembers(ctx context.Context, convID string, requesterID int) ([]models.ConversationMemberProfile, error)
 	RemoveMemberFromGroup(ctx context.Context, convID string, targetUserID int) error
 	UpdateLastReadWatermark(ctx context.Context, convID string, userID int, messageID int64) error
-	GetGroupReadWatermarks(ctx context.Context, convID string) (map[int64][]models.ReadReceiptUser, error)
+	GetGroupReadWatermarks(ctx context.Context, convID string, minMessageID int64) (map[int64][]models.ReadReceiptUser, error)
 }
 
 type chatService struct {
@@ -88,6 +88,6 @@ func (s *chatService) RemoveMemberFromGroup(ctx context.Context, convID string, 
 func (s *chatService) UpdateLastReadWatermark(ctx context.Context, convID string, userID int, messageID int64) error {
 	return s.chatRepo.UpdateLastReadWatermark(ctx, convID, userID, messageID)
 }
-func (s *chatService) GetGroupReadWatermarks(ctx context.Context, convID string) (map[int64][]models.ReadReceiptUser, error) {
-	return s.chatRepo.GetGroupReadWatermarks(ctx, convID)
+func (s *chatService) GetGroupReadWatermarks(ctx context.Context, convID string, minMessageID int64) (map[int64][]models.ReadReceiptUser, error) {
+	return s.chatRepo.GetGroupReadWatermarks(ctx, convID, minMessageID)
 }

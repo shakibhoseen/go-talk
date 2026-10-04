@@ -34,3 +34,9 @@ type MessageWithReceipts struct {
 	ReadBy    []ReadReceiptUser `json:"read_by,omitempty"`
 	ReadCount int               `json:"read_count"`
 }
+
+// MessageWatermark: Top-level watermarks response map value
+type MessageWatermark struct {
+	Users []ReadReceiptUser `json:"users"`
+	Count int               `json:"count"`
+}
