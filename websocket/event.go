@@ -6,8 +6,9 @@ type EventType string
 
 const (
 	// Chat Messaging Events
-	EventSendMessage EventType = "send_message"
-	EventNewMessage  EventType = "new_message"
+	EventSendMessage         EventType = "send_message"
+	EventNewMessage          EventType = "new_message"
+	EventMemberReadWatermark EventType = "member_read_watermark"
 
 	// WhatsApp 3-State Delivery Status Events
 	EventAckDelivered  EventType = "ack_delivered"

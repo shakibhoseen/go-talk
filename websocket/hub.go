@@ -93,9 +93,21 @@ func (h *Hub) SendDirect(targetUserID int, eventType EventType, payload any) {
 	h.mu.RLock()
 	userConns, ok := h.clients[targetUserID]
 	if !ok {
+		log.Printf(
+			"[SEND_DIRECT] user=%d NOT CONNECTED, event=%s",
+			targetUserID,
+			eventType,
+		)
 		h.mu.RUnlock()
 		return
 	}
+	log.Printf(
+		"[SEND_DIRECT] user=%d event=%s connections=%d",
+		targetUserID,
+		eventType,
+		len(userConns),
+	)
+
 	// Snapshot the client set so we can release the read lock before touching channels
 	targets := make([]*Client, 0, len(userConns))
 	for client := range userConns {
@@ -205,6 +217,13 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 		if err := json.Unmarshal(event.Payload, &ack); err != nil {
 			return
 		}
+		log.Printf(
+			"[ACK_SEEN] user=%d conversation=%s message=%d sender=%d",
+			client.UserID,
+			ack.ConversationID,
+			ack.MessageID,
+			ack.SenderID,
+		)
 
 		ctx := context.Background()
 
@@ -214,6 +233,12 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 		// ২. conversation_members টেবিলে ওয়াটারমার্ক পয়েন্টার আপডেট
 		_ = h.chatRepo.UpdateLastReadWatermark(ctx, ack.ConversationID, client.UserID, ack.MessageID)
 
+		log.Printf(
+			"[WATERMARK] user=%d -> message=%d conversation=%s",
+			client.UserID,
+			ack.MessageID,
+			ack.ConversationID,
+		)
 		// ৩. মেম্বারদের লাইভ বাবল ও সিন স্ট্যাটাস ব্রডকাস্ট
 		members, err := h.chatRepo.GetConversationMemberIDs(ctx, ack.ConversationID)
 		if err != nil {
@@ -223,20 +248,26 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 		watermarkPayload := map[string]any{
 			"conversation_id":      ack.ConversationID,
 			"user_id":              client.UserID,
-			"user_name":            client.UserName,   // cached at connect time
-			"user_avatar":          client.AvatarURL,  // cached at connect time
+			"user_name":            client.UserName,  // cached at connect time
+			"user_avatar":          client.AvatarURL, // cached at connect time
 			"last_read_message_id": ack.MessageID,
 		}
 
 		for _, memberID := range members {
 			if memberID != client.UserID {
+				log.Printf(
+					"[WATERMARK_BROADCAST] reader=%d message=%d -> member=%d",
+					client.UserID,
+					ack.MessageID,
+					memberID,
+				)
 				h.SendDirect(memberID, EventStatusUpdated, map[string]any{
 					"conversation_id": ack.ConversationID,
 					"upto_message_id": ack.MessageID,
 					"status":          "seen",
 					"by_user":         client.UserID,
 				})
-				h.SendDirect(memberID, "member_read_watermark", watermarkPayload)
+				h.SendDirect(memberID, EventMemberReadWatermark, watermarkPayload)
 			}
 		}
 

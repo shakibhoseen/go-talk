@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"sync"
@@ -62,10 +63,10 @@ func (c *Client) ReadPump() {
 
 func (c *Client) WritePump() {
 	ticker := time.NewTicker(pingPeriod)
+
 	defer func() {
 		ticker.Stop()
 		c.Conn.Close()
-		// Ensure Hub cleanup happens if WritePump exits (e.g. write deadline exceeded)
 		c.Hub.unregister <- c
 	}()
 
@@ -73,32 +74,70 @@ func (c *Client) WritePump() {
 		select {
 		case message, ok := <-c.send:
 			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+
 			if !ok {
-				// The Hub closed the channel
-				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				c.Conn.WriteMessage(
+					websocket.CloseMessage,
+					[]byte{},
+				)
 				return
 			}
 
-			w, err := c.Conn.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-			w.Write(message)
+			// First queued event.
+			messages := [][]byte{message}
 
-			// Batch pending messages in buffer
+			// Collect events that are already waiting in the queue.
 			n := len(c.send)
+
 			for i := 0; i < n; i++ {
-				w.Write([]byte{'\n'})
-				w.Write(<-c.send)
+				messages = append(messages, <-c.send)
 			}
 
-			if err := w.Close(); err != nil {
+			// Convert:
+			//
+			// event
+			// event
+			// event
+			//
+			// into:
+			//
+			// [event, event, event]
+			batch := make([]json.RawMessage, 0, len(messages))
+
+			for _, message := range messages {
+				batch = append(batch, json.RawMessage(message))
+			}
+
+			data, err := json.Marshal(batch)
+			if err != nil {
+				log.Printf(
+					"[WRITE_PUMP] failed to marshal batch: %v",
+					err,
+				)
+				continue
+			}
+
+			log.Printf(
+				"[WRITE_PUMP] user=%d batch_size=%d sending=%s",
+				c.UserID,
+				len(batch),
+				string(data),
+			)
+
+			if err := c.Conn.WriteMessage(
+				websocket.TextMessage,
+				data,
+			); err != nil {
 				return
 			}
 
 		case <-ticker.C:
 			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+
+			if err := c.Conn.WriteMessage(
+				websocket.PingMessage,
+				nil,
+			); err != nil {
 				return
 			}
 		}
