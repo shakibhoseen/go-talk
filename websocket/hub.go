@@ -6,6 +6,7 @@ import (
 	"go-talk/models"
 	"go-talk/repository"
 	"log"
+	"strings"
 	"sync"
 )
 
@@ -149,6 +150,20 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			return
 		}
 
+		if p.ConversationID == "" {
+			return
+		}
+
+		var clientMsgID *string
+		trimmedClientMsgID := strings.TrimSpace(p.ClientMessageID)
+		if trimmedClientMsgID != "" {
+			if len(trimmedClientMsgID) > 64 {
+				log.Printf("Invalid client_message_id: exceeds max length 64 (len=%d)", len(trimmedClientMsgID))
+				return
+			}
+			clientMsgID = &trimmedClientMsgID
+		}
+
 		ctx := context.Background()
 
 		convType, _ := h.chatRepo.GetConversationType(ctx, p.ConversationID)
@@ -162,20 +177,29 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			SenderID:         client.UserID,
 			SenderName:       client.UserName,
 			SenderAvatar:     client.AvatarURL,
+			ClientMessageID:  clientMsgID,
 			MessageType:      models.MessageType(p.MessageType),
 			Content:          p.Content,
 		}
 
-		// ১. ডেটাবেসে মেসেজ ও লাস্ট মেসেজ সেভ (সেন্ডারের read ও delivered ওয়াটারমার্ক সহ)
-		if err := h.chatRepo.SaveMessage(ctx, msg); err != nil {
+		// ১. ডেটাবেসে মেসেজ ও লাস্ট মেসেজ সেভ (idempotent)
+		isNew, err := h.chatRepo.SaveMessage(ctx, msg)
+		if err != nil {
 			log.Println("Failed to save message:", err)
 			return
 		}
 
-		// ২. প্রেরককে 'Sent' স্ট্যাটাস হিসেবে পাঠানো (Single Tick)
+		// ২. প্রেরককে 'Sent' স্ট্যাটাস হিসেবে পাঠানো (authoritative echo in both first send & retry)
 		h.SendDirect(client.UserID, EventNewMessage, msg)
 
-		// ৩. কনভারসেশনের বাকি মেম্বারদের খুঁজে বের করে লাইভ মেসেজ পাঠানো
+		// ৩. Duplicate retry হলে মেম্বারদের দ্বিতীয়বার ব্রডকাস্ট পাঠানো স্কিপ
+		if !isNew {
+			log.Printf("[IDEMPOTENT_RETRY] Message %d already exists for client_message_id=%v; skipping recipient broadcast",
+				msg.ID, p.ClientMessageID)
+			return
+		}
+
+		// ৪. নতুন মেসেজ হলে কনভারসেশনের বাকি মেম্বারদের লাইভ মেসেজ পাঠানো
 		members, err := h.chatRepo.GetConversationMemberIDs(ctx, p.ConversationID)
 		if err != nil {
 			log.Println("Error fetching members:", err)
@@ -200,14 +224,28 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 
 		ctx := context.Background()
 
-		// 1. এই ইউজারের delivered watermark এবং receipt টেবিলে আপডেট
+		// 1. Authorization: check conversation membership
+		isMember, err := h.chatRepo.IsConversationMember(ctx, ack.ConversationID, client.UserID)
+		if err != nil || !isMember {
+			log.Printf("[SECURITY] User %d is not a member of conversation %s; rejecting ack_delivered", client.UserID, ack.ConversationID)
+			return
+		}
+
+		// 2. Validation: message exists in conversation and <= last_message_id; derive authoritative sender ID
+		actualSenderID, err := h.chatRepo.GetMessageSenderInConversation(ctx, ack.ConversationID, ack.MessageID)
+		if err != nil {
+			log.Printf("[VALIDATION] Message %d invalid in conversation %s; rejecting ack_delivered: %v", ack.MessageID, ack.ConversationID, err)
+			return
+		}
+
+		// 3. Update delivered watermark and message receipt
 		_ = h.chatRepo.UpdateLastDeliveredWatermark(ctx, ack.ConversationID, client.UserID, ack.MessageID)
 		_ = h.chatRepo.MarkMessageDelivered(ctx, ack.MessageID, client.UserID)
 
-		// 2. WhatsApp রুল: কনভারসেশনের বাকি সকল মেম্বার মেসেজটি পেয়েছে কি না চেক
-		allDelivered, err := h.chatRepo.AreAllMembersDeliveredUpto(ctx, ack.ConversationID, ack.SenderID, ack.MessageID)
+		// 4. Check if all members have received up to messageID
+		allDelivered, err := h.chatRepo.AreAllMembersDeliveredUpto(ctx, ack.ConversationID, actualSenderID, ack.MessageID)
 		if err == nil && allDelivered {
-			targetSenderID := ack.SenderID
+			targetSenderID := actualSenderID
 			if targetSenderID > 0 {
 				h.SendDirect(targetSenderID, EventStatusUpdated, map[string]any{
 					"conversation_id": ack.ConversationID,
@@ -236,17 +274,33 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 		if ack.MessageID <= 0 || ack.ConversationID == "" {
 			return
 		}
+
+		ctx := context.Background()
+
+		// 1. Authorization: check conversation membership
+		isMember, err := h.chatRepo.IsConversationMember(ctx, ack.ConversationID, client.UserID)
+		if err != nil || !isMember {
+			log.Printf("[SECURITY] User %d is not a member of conversation %s; rejecting ack_seen", client.UserID, ack.ConversationID)
+			return
+		}
+
+		// 2. Validation: message exists in conversation and <= last_message_id; derive authoritative sender ID
+		actualSenderID, err := h.chatRepo.GetMessageSenderInConversation(ctx, ack.ConversationID, ack.MessageID)
+		if err != nil {
+			log.Printf("[VALIDATION] Message %d invalid in conversation %s; rejecting ack_seen: %v", ack.MessageID, ack.ConversationID, err)
+			return
+		}
+
 		log.Printf(
-			"[ACK_SEEN] user=%d conversation=%s message=%d sender=%d",
+			"[ACK_SEEN] user=%d conversation=%s message=%d client_sender=%d actual_sender=%d",
 			client.UserID,
 			ack.ConversationID,
 			ack.MessageID,
 			ack.SenderID,
+			actualSenderID,
 		)
 
-		ctx := context.Background()
-
-		// ১. Messages টেবিলে রেঞ্জ সিন স্ট্যাটাস এবং ওয়াটারমার্ক (read + delivered) আপডেট
+		// 3. Update seen status in range and watermarks
 		_ = h.chatRepo.MarkMessagesSeenUpto(ctx, ack.ConversationID, client.UserID, ack.MessageID)
 		_ = h.chatRepo.UpdateLastReadWatermark(ctx, ack.ConversationID, client.UserID, ack.MessageID)
 
@@ -257,7 +311,7 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			ack.ConversationID,
 		)
 
-		// ২. মেম্বারদের লাইভ বাবল ওয়াটারমার্ক ব্রডকাস্ট (কার কার পড়া শেষ তা ছোট Avatar দিয়ে দেখানোর জন্য)
+		// 4. Broadcast live avatar watermark to members
 		members, err := h.chatRepo.GetConversationMemberIDs(ctx, ack.ConversationID)
 		if err == nil {
 			watermarkPayload := map[string]any{
@@ -275,10 +329,10 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			}
 		}
 
-		// ৩. WhatsApp রুল: কনভারসেশনের বাকি সকল মেম্বার সিন করেছে কি না চেক (সবাই সিন করলেই Double Blue Tick)
-		allRead, err := h.chatRepo.AreAllMembersReadUpto(ctx, ack.ConversationID, ack.SenderID, ack.MessageID)
+		// 5. WhatsApp check: all members read up to messageID
+		allRead, err := h.chatRepo.AreAllMembersReadUpto(ctx, ack.ConversationID, actualSenderID, ack.MessageID)
 		if err == nil && allRead {
-			targetSenderID := ack.SenderID
+			targetSenderID := actualSenderID
 			if targetSenderID > 0 {
 				h.SendDirect(targetSenderID, EventStatusUpdated, map[string]any{
 					"conversation_id": ack.ConversationID,

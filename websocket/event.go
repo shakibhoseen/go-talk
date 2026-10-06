@@ -33,10 +33,11 @@ type Event struct {
 
 // Payload for sending text/media messages
 type SendMessagePayload struct {
-	ConversationID string `json:"conversation_id"`
-	SenderName     string `json:"sender_name"`
-	Content        string `json:"content"`
-	MessageType    string `json:"message_type"` // "text", "image", "audio"
+	ConversationID  string `json:"conversation_id"`
+	SenderName      string `json:"sender_name"`
+	ClientMessageID string `json:"client_message_id,omitempty"`
+	Content         string `json:"content"`
+	MessageType     string `json:"message_type"` // "text", "image", "audio"
 }
 
 // Payload for Delivery / Seen ACK

@@ -17,6 +17,7 @@ type Message struct {
 	SenderID         int         `json:"sender_id"`
 	SenderName       string      `json:"sender_name,omitempty"`
 	SenderAvatar     string      `json:"sender_avatar,omitempty"`
+	ClientMessageID  *string     `json:"client_message_id,omitempty"`
 	MessageType      MessageType `json:"message_type"`
 	Content          string      `json:"content"`
 	CreatedAt        time.Time   `json:"created_at"`

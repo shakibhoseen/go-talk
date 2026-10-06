@@ -7,12 +7,14 @@ import (
 	"go-talk/models"
 )
 
+var ErrClientMessageIDConflict = errors.New("conflict: client_message_id already exists with different content")
+
 type ChatRepository interface {
 	UpdateGroupAvatar(ctx context.Context, convID string, avatarURL string) error
 	GetConversationMembers(ctx context.Context, convID string) ([]models.ConversationMemberProfile, error)
 	GetUserRoleInConversation(ctx context.Context, convID string, userID int) (string, error)
-	// ACID Transaction: Inserts message and atomically updates conversation head
-	SaveMessage(ctx context.Context, msg *models.Message) error
+	// ACID Transaction: Inserts message and atomically updates conversation head. Returns (isNew, error).
+	SaveMessage(ctx context.Context, msg *models.Message) (bool, error)
 
 	// Inbox loading: Extremely fast query on conversations table
 	GetUserConversations(ctx context.Context, userID int) ([]models.Conversation, error)
@@ -26,6 +28,8 @@ type ChatRepository interface {
 	// Notun: Conversation-er sokol member ID ber kora
 	GetConversationMemberIDs(ctx context.Context, convID string) ([]int, error)
 	GetConversationType(ctx context.Context, convID string) (string, error)
+	IsConversationMember(ctx context.Context, convID string, userID int) (bool, error)
+	GetMessageSenderInConversation(ctx context.Context, convID string, messageID int64) (int, error)
 
 	MarkMessageDelivered(ctx context.Context, messageID int64, userID int) error
 	MarkMessagesSeenUpto(ctx context.Context, convID string, userID int, uptoMessageID int64) error
@@ -50,23 +54,7 @@ func NewChatRepository(db *sql.DB) ChatRepository {
 	return &chatRepo{db: db}
 }
 
-func (r *chatRepo) SaveMessage(ctx context.Context, msg *models.Message) error {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	// 1. Insert into messages table
-	msgQuery := `INSERT INTO messages (conversation_id, sender_id, message_type, content, created_at)
-	             VALUES ($1, $2, $3, $4, NOW())
-	             RETURNING id, created_at`
-	if err := tx.QueryRowContext(ctx, msgQuery, msg.ConversationID, msg.SenderID, msg.MessageType, msg.Content).
-		Scan(&msg.ID, &msg.CreatedAt); err != nil {
-		return err
-	}
-
-	// 2. Update conversation head cache
+func (r *chatRepo) updateHeadAndWatermarks(ctx context.Context, tx *sql.Tx, msg *models.Message) error {
 	headQuery := `UPDATE conversations 
 	              SET last_message_id = $1,
 	                  last_message_content = $2,
@@ -78,7 +66,6 @@ func (r *chatRepo) SaveMessage(ctx context.Context, msg *models.Message) error {
 		return err
 	}
 
-	// 3. Auto-update sender's own read & delivered watermark to the message they just sent!
 	watermarkQuery := `UPDATE conversation_members
 					   SET last_read_message_id = $1, last_delivered_message_id = $1
 					   WHERE conversation_id = $2 AND user_id = $3`
@@ -91,8 +78,72 @@ func (r *chatRepo) SaveMessage(ctx context.Context, msg *models.Message) error {
 		return errors.New("conversation head not found to update")
 	}
 
-	// 3. Commit transaction
-	return tx.Commit()
+	return nil
+}
+
+func (r *chatRepo) SaveMessage(ctx context.Context, msg *models.Message) (bool, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	if msg.ClientMessageID != nil && *msg.ClientMessageID != "" {
+		msgQuery := `INSERT INTO messages (conversation_id, sender_id, client_message_id, message_type, content, created_at)
+		             VALUES ($1, $2, $3, $4, $5, NOW())
+		             ON CONFLICT (conversation_id, sender_id, client_message_id) WHERE client_message_id IS NOT NULL DO NOTHING
+		             RETURNING id, created_at`
+		err := tx.QueryRowContext(ctx, msgQuery, msg.ConversationID, msg.SenderID, *msg.ClientMessageID, msg.MessageType, msg.Content).
+			Scan(&msg.ID, &msg.CreatedAt)
+		if err == nil {
+			// Brand new message
+			if err := r.updateHeadAndWatermarks(ctx, tx, msg); err != nil {
+				return false, err
+			}
+			return true, tx.Commit()
+		}
+
+		if !errors.Is(err, sql.ErrNoRows) {
+			return false, err
+		}
+
+		// Conflict: Row already exists with this (conversation_id, sender_id, client_message_id)
+		var existingContent string
+		var existingMsgType models.MessageType
+		fetchQuery := `SELECT id, content, message_type, created_at
+		               FROM messages
+		               WHERE conversation_id = $1 AND sender_id = $2 AND client_message_id = $3`
+		if err := tx.QueryRowContext(ctx, fetchQuery, msg.ConversationID, msg.SenderID, *msg.ClientMessageID).
+			Scan(&msg.ID, &existingContent, &existingMsgType, &msg.CreatedAt); err != nil {
+			return false, err
+		}
+
+		// Duplicate Request Integrity Rule: Reject if content or message_type changed
+		if existingContent != msg.Content || existingMsgType != msg.MessageType {
+			return false, ErrClientMessageIDConflict
+		}
+
+		// Exact retry: Commit transaction, skip side effects, return isNew = false
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	// Legacy / no client_message_id path:
+	msgQuery := `INSERT INTO messages (conversation_id, sender_id, message_type, content, created_at)
+	             VALUES ($1, $2, $3, $4, NOW())
+	             RETURNING id, created_at`
+	if err := tx.QueryRowContext(ctx, msgQuery, msg.ConversationID, msg.SenderID, msg.MessageType, msg.Content).
+		Scan(&msg.ID, &msg.CreatedAt); err != nil {
+		return false, err
+	}
+
+	if err := r.updateHeadAndWatermarks(ctx, tx, msg); err != nil {
+		return false, err
+	}
+
+	return true, tx.Commit()
 }
 
 func (r *chatRepo) GetUserConversations(ctx context.Context, userID int) ([]models.Conversation, error) {
@@ -181,9 +232,9 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, c
 	if sinceID > 0 {
 		// Forward delta sync: newest messages after sinceID in chronological ASC order
 		query = `
-			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.message_type, sub.content, sub.created_at
+			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.client_message_id, sub.message_type, sub.content, sub.created_at
 			FROM (
-				SELECT id, conversation_id, sender_id, message_type, content, created_at
+				SELECT id, conversation_id, sender_id, client_message_id, message_type, content, created_at
 				FROM messages
 				WHERE conversation_id = $1 AND id > $2
 				ORDER BY id ASC
@@ -195,9 +246,9 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, c
 	} else if beforeID > 0 {
 		// Backward pagination: older messages before beforeID in reverse chronological DESC order
 		query = `
-			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.message_type, sub.content, sub.created_at
+			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.client_message_id, sub.message_type, sub.content, sub.created_at
 			FROM (
-				SELECT id, conversation_id, sender_id, message_type, content, created_at
+				SELECT id, conversation_id, sender_id, client_message_id, message_type, content, created_at
 				FROM messages
 				WHERE conversation_id = $1 AND id < $2
 				ORDER BY id DESC
@@ -209,9 +260,9 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, c
 	} else {
 		// Initial fetch: latest messages in reverse chronological DESC order
 		query = `
-			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.message_type, sub.content, sub.created_at
+			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.client_message_id, sub.message_type, sub.content, sub.created_at
 			FROM (
-				SELECT id, conversation_id, sender_id, message_type, content, created_at
+				SELECT id, conversation_id, sender_id, client_message_id, message_type, content, created_at
 				FROM messages
 				WHERE conversation_id = $1
 				ORDER BY id DESC
@@ -231,7 +282,7 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, c
 	msgs := make([]models.Message, 0)
 	for rows.Next() {
 		var m models.Message
-		if err := rows.Scan(&m.ID, &m.ConversationID, &m.SenderID, &m.SenderName, &m.SenderAvatar, &m.MessageType, &m.Content, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.SenderID, &m.SenderName, &m.SenderAvatar, &m.ClientMessageID, &m.MessageType, &m.Content, &m.CreatedAt); err != nil {
 			return nil, false, err
 		}
 		m.ConversationType = convType
@@ -312,9 +363,29 @@ func (r *chatRepo) GetConversationMemberIDs(ctx context.Context, convID string) 
 	return memberIDs, rows.Err()
 }
 
+func (r *chatRepo) IsConversationMember(ctx context.Context, convID string, userID int) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2)`
+	var exists bool
+	err := r.db.QueryRowContext(ctx, query, convID, userID).Scan(&exists)
+	return exists, err
+}
+
+func (r *chatRepo) GetMessageSenderInConversation(ctx context.Context, convID string, messageID int64) (int, error) {
+	query := `SELECT m.sender_id 
+	          FROM messages m 
+	          JOIN conversations c ON m.conversation_id = c.id 
+	          WHERE m.id = $1 AND m.conversation_id = $2 AND m.id <= c.last_message_id`
+	var senderID int
+	err := r.db.QueryRowContext(ctx, query, messageID, convID).Scan(&senderID)
+	return senderID, err
+}
+
 func (r *chatRepo) MarkMessageDelivered(ctx context.Context, messageID int64, userID int) error {
 	query := `INSERT INTO message_receipts (message_id, user_id, status, updated_at)
-	          VALUES ($1, $2, 'delivered', NOW())
+	          SELECT m.id, $2, 'delivered', NOW()
+	          FROM messages m
+	          WHERE m.id = $1
+	            AND EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = m.conversation_id AND user_id = $2)
 	          ON CONFLICT (message_id, user_id) 
 	          DO UPDATE SET status = 'delivered', updated_at = NOW()
 	          WHERE message_receipts.status != 'seen'`
@@ -330,6 +401,7 @@ func (r *chatRepo) MarkMessagesSeenUpto(ctx context.Context, convID string, user
 	          WHERE m.conversation_id = $2 
 	            AND m.id <= $3 
 	            AND m.sender_id != $1
+	            AND EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.conversation_id = $2 AND cm.user_id = $1)
 	          ON CONFLICT (message_id, user_id) 
 	          DO UPDATE SET status = 'seen', updated_at = NOW()`
 	_, err := r.db.ExecContext(ctx, query, userID, convID, uptoMessageID)

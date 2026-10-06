@@ -83,7 +83,7 @@ func TestGetMessagesDeltaSyncHandler(t *testing.T) {
 			MessageType:    "text",
 			Content:        fmt.Sprintf("Msg %d", i),
 		}
-		if err := chatRepo.SaveMessage(ctx, msg); err != nil {
+		if _, err := chatRepo.SaveMessage(ctx, msg); err != nil {
 			t.Fatalf("Failed to save msg %d: %v", i, err)
 		}
 		msgIDs = append(msgIDs, msg.ID)
@@ -172,5 +172,50 @@ func TestGetMessagesDeltaSyncHandler(t *testing.T) {
 	watermarkKey := fmt.Sprintf("%d", msgIDs[1])
 	if wm, ok := emptyResp.Watermarks[watermarkKey]; !ok || wm.Count == 0 {
 		t.Fatalf("Expected watermark for %s with count > 0, got %+v", watermarkKey, emptyResp.Watermarks)
+	}
+
+	// 4. Test client_message_id in HTTP GET messages response
+	clientUUID := "c7b39a48-4fa3-4cb5-8292-80eafe14c772"
+	idempMsg := &models.Message{
+		ConversationID:  convID,
+		SenderID:        u1,
+		ClientMessageID: &clientUUID,
+		MessageType:     "text",
+		Content:         "Idempotency HTTP test",
+	}
+	if _, err := chatRepo.SaveMessage(ctx, idempMsg); err != nil {
+		t.Fatalf("Failed to save idempMsg: %v", err)
+	}
+
+	req = httptest.NewRequest("GET", fmt.Sprintf("/conversations/%s/messages?since_id=%d&limit=10", convID, msgIDs[2]), nil)
+	req.SetPathValue("id", convID)
+	req.Header.Set("Authorization", "Bearer "+aliceToken)
+	rec = httptest.NewRecorder()
+
+	chatHandler.GetMessages(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", rec.Code)
+	}
+
+	var idempResp struct {
+		Messages []models.Message `json:"messages"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &idempResp); err != nil {
+		t.Fatalf("Failed to unmarshal idemp response: %v", err)
+	}
+	if len(idempResp.Messages) == 0 {
+		t.Fatalf("Expected messages, got 0")
+	}
+	foundIdemp := false
+	for _, m := range idempResp.Messages {
+		if m.ID == idempMsg.ID {
+			foundIdemp = true
+			if m.ClientMessageID == nil || *m.ClientMessageID != clientUUID {
+				t.Fatalf("Expected client_message_id %s, got %v", clientUUID, m.ClientMessageID)
+			}
+		}
+	}
+	if !foundIdemp {
+		t.Fatalf("Expected to find idempMsg in response")
 	}
 }
