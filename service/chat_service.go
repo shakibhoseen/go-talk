@@ -11,7 +11,7 @@ type ChatService interface {
 	GetOrCreateDirectChat(ctx context.Context, currentUserID, targetUserID int) (string, error)
 	CreateGroupChat(ctx context.Context, title string, creatorID int, memberIDs []int) (string, error)
 	GetMyConversations(ctx context.Context, userID int) ([]models.Conversation, error)
-	GetChatMessages(ctx context.Context, convID string, currentUserID int, limit int, beforeID int64) ([]models.Message, bool, error)
+	GetChatMessages(ctx context.Context, convID string, currentUserID int, limit int, beforeID int64, sinceID int64) ([]models.Message, bool, error)
 	AddMemberToGroup(ctx context.Context, convID string, targetUserID int, requesterID int) error
 	UpdateGroupAvatar(ctx context.Context, convID string, avatarURL string, requesterID int) error
 	GetConversationMembers(ctx context.Context, convID string, requesterID int) ([]models.ConversationMemberProfile, error)
@@ -37,11 +37,11 @@ func (s *chatService) GetMyConversations(ctx context.Context, userID int) ([]mod
 	return s.chatRepo.GetUserConversations(ctx, userID)
 }
 
-func (s *chatService) GetChatMessages(ctx context.Context, convID string, currentUserID int, limit int, beforeID int64) ([]models.Message, bool, error) {
+func (s *chatService) GetChatMessages(ctx context.Context, convID string, currentUserID int, limit int, beforeID int64, sinceID int64) ([]models.Message, bool, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	return s.chatRepo.GetConversationMessages(ctx, convID, currentUserID, limit, beforeID)
+	return s.chatRepo.GetConversationMessages(ctx, convID, currentUserID, limit, beforeID, sinceID)
 }
 
 // Service Struct-e method implement korun:

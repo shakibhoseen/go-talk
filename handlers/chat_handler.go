@@ -96,19 +96,36 @@ func (h *ChatHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
 	convID := r.PathValue("id")
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	beforeID, _ := strconv.ParseInt(r.URL.Query().Get("before_id"), 10, 64)
+	sinceID, _ := strconv.ParseInt(r.URL.Query().Get("since_id"), 10, 64)
 
-	messages, hasMore, err := h.chatSvc.GetChatMessages(r.Context(), convID, currentUserID, limit, beforeID)
+	if beforeID > 0 && sinceID > 0 {
+		http.Error(w, "Cannot specify both before_id and since_id", http.StatusBadRequest)
+		return
+	}
+
+	messages, hasMore, err := h.chatSvc.GetChatMessages(r.Context(), convID, currentUserID, limit, beforeID, sinceID)
 	if err != nil {
-		http.Error(w, "Failed to fetch messages", http.StatusInternalServerError)
+		if err.Error() == "forbidden: user is not a member of this conversation" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		if err.Error() == "conversation not found" {
+			http.Error(w, "Conversation not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Failed to fetch messages: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	var minMessageID int64 = 0
-	if len(messages) > 0 {
+	if sinceID > 0 {
+		// Delta sync: fetch all current member watermarks regardless of message range
+		minMessageID = 0
+	} else if len(messages) > 0 {
 		minMessageID = messages[len(messages)-1].ID
 	}
 
-	// ২. মেম্বারদের ওয়াটারমার্ক (কার কতটুকু দেখা শেষ) ফেচ করা (নতুন মেথড)
+	// ২. মেম্বারদের ওয়াটারমার্ক (কার কতটুকু দেখা শেষ) ফেচ করা
 	watermarks, err := h.chatSvc.GetGroupReadWatermarks(r.Context(), convID, minMessageID)
 	if err != nil {
 		// এরর হলে খালি ম্যাপ ধরে প্রসেস করবে যাতে এপিআই ফেইল না করে
@@ -118,41 +135,50 @@ func (h *ChatHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
 	const maxVisibleAvatars = 3
 	watermarkMap := make(map[string]models.MessageWatermark)
 
-	for _, m := range messages {
-		users := watermarks[m.ID]
-		totalRead := len(users)
-
-		if totalRead == 0 {
+	for msgID, users := range watermarks {
+		if msgID <= 0 || len(users) == 0 {
 			continue
 		}
 
 		var visibleUsers []models.ReadReceiptUser
-		if totalRead > maxVisibleAvatars {
+		if len(users) > maxVisibleAvatars {
 			visibleUsers = users[:maxVisibleAvatars]
 		} else {
 			visibleUsers = users
 		}
 
-		watermarkMap[strconv.FormatInt(m.ID, 10)] = models.MessageWatermark{
+		watermarkMap[strconv.FormatInt(msgID, 10)] = models.MessageWatermark{
 			Users: visibleUsers,
-			Count: totalRead,
+			Count: len(users),
 		}
 	}
 
-	var nextBeforeID *int64 = nil
-	if len(messages) > 0 && hasMore {
-		// Chronological (ASC) list-e index 0 holo shobcheye purono message ID
-		oldestId := messages[len(messages)-1].ID
-		nextBeforeID = &oldestId
-	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"messages":       messages,
-		"watermarks":     watermarkMap,
-		"has_more":       hasMore,
-		"next_before_id": nextBeforeID,
-	})
+	if sinceID > 0 {
+		var nextSinceID int64 = sinceID
+		if len(messages) > 0 {
+			nextSinceID = messages[len(messages)-1].ID
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"messages":      messages,
+			"watermarks":    watermarkMap,
+			"has_more":      hasMore,
+			"next_since_id": nextSinceID,
+		})
+	} else {
+		var nextBeforeID *int64 = nil
+		if len(messages) > 0 && hasMore {
+			// Chronological (DESC) list-e index len-1 holo shobcheye purono message ID
+			oldestId := messages[len(messages)-1].ID
+			nextBeforeID = &oldestId
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"messages":       messages,
+			"watermarks":     watermarkMap,
+			"has_more":       hasMore,
+			"next_before_id": nextBeforeID,
+		})
+	}
 }
 
 // POST /conversations/group

@@ -17,8 +17,8 @@ type ChatRepository interface {
 	// Inbox loading: Extremely fast query on conversations table
 	GetUserConversations(ctx context.Context, userID int) ([]models.Conversation, error)
 
-	// Chat screen inside: Messages with pagination
-	GetConversationMessages(ctx context.Context, convID string, currentUserID int, limit int, beforeID int64) ([]models.Message, bool, error)
+	// Chat screen inside: Messages with pagination (supports backward beforeID and forward delta sinceID)
+	GetConversationMessages(ctx context.Context, convID string, currentUserID int, limit int, beforeID int64, sinceID int64) ([]models.Message, bool, error)
 
 	// Direct chat find or create helper
 	GetOrCreateDirectConversation(ctx context.Context, user1, user2 int) (string, error)
@@ -138,7 +138,7 @@ func (r *chatRepo) GetUserConversations(ctx context.Context, userID int) ([]mode
 	return convs, rows.Err()
 }
 
-func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, currentUserID int, limit int, beforeID int64) ([]models.Message, bool, error) {
+func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, currentUserID int, limit int, beforeID int64, sinceID int64) ([]models.Message, bool, error) {
 	// 1. Default limit set করা (যাতে কেউ একসাথে অনেক ডেটা রিকোয়েস্ট করে সার্ভার ডাউন না করতে পারে)
 	if limit <= 0 || limit > 50 {
 		limit = 20
@@ -148,10 +148,12 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, c
 	fetchLimit := limit + 1
 
 	var convType string
+	var isMember bool
 	var minDelivered, minRead int64
 	statusQuery := `
 		SELECT 
 			c.type,
+			EXISTS(SELECT 1 FROM conversation_members WHERE conversation_id = c.id AND user_id = $2) AS is_member,
 			COALESCE(MIN(cm.last_delivered_message_id), 0) AS min_delivered,
 			COALESCE(MIN(cm.last_read_message_id), 0) AS min_read
 		FROM conversations c
@@ -159,7 +161,16 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, c
 		WHERE c.id = $1
 		GROUP BY c.id, c.type
 	`
-	_ = r.db.QueryRowContext(ctx, statusQuery, convID, currentUserID).Scan(&convType, &minDelivered, &minRead)
+	err := r.db.QueryRowContext(ctx, statusQuery, convID, currentUserID).Scan(&convType, &isMember, &minDelivered, &minRead)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, errors.New("conversation not found")
+		}
+		return nil, false, err
+	}
+	if !isMember {
+		return nil, false, errors.New("forbidden: user is not a member of this conversation")
+	}
 	if convType == "" {
 		convType = "direct"
 	}
@@ -167,7 +178,22 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, c
 	var query string
 	var args []any
 
-	if beforeID > 0 {
+	if sinceID > 0 {
+		// Forward delta sync: newest messages after sinceID in chronological ASC order
+		query = `
+			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.message_type, sub.content, sub.created_at
+			FROM (
+				SELECT id, conversation_id, sender_id, message_type, content, created_at
+				FROM messages
+				WHERE conversation_id = $1 AND id > $2
+				ORDER BY id ASC
+				LIMIT $3
+			) sub
+			JOIN users u ON sub.sender_id = u.id
+			ORDER BY sub.id ASC`
+		args = []any{convID, sinceID, fetchLimit}
+	} else if beforeID > 0 {
+		// Backward pagination: older messages before beforeID in reverse chronological DESC order
 		query = `
 			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.message_type, sub.content, sub.created_at
 			FROM (
@@ -181,6 +207,7 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, c
 			ORDER BY sub.id DESC`
 		args = []any{convID, beforeID, fetchLimit}
 	} else {
+		// Initial fetch: latest messages in reverse chronological DESC order
 		query = `
 			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.message_type, sub.content, sub.created_at
 			FROM (
@@ -201,7 +228,7 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, c
 	}
 	defer rows.Close()
 
-	var msgs []models.Message
+	msgs := make([]models.Message, 0)
 	for rows.Next() {
 		var m models.Message
 		if err := rows.Scan(&m.ID, &m.ConversationID, &m.SenderID, &m.SenderName, &m.SenderAvatar, &m.MessageType, &m.Content, &m.CreatedAt); err != nil {
