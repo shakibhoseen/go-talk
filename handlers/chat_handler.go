@@ -87,7 +87,7 @@ func (h *ChatHandler) GetConversations(w http.ResponseWriter, r *http.Request) {
 
 // GET /conversations/{id}/messages (Chat Screen Inside)
 func (h *ChatHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
-	_, err := h.extractUserID(r)
+	currentUserID, err := h.extractUserID(r)
 	if err != nil {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
@@ -97,7 +97,7 @@ func (h *ChatHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	beforeID, _ := strconv.ParseInt(r.URL.Query().Get("before_id"), 10, 64)
 
-	messages, hasMore, err := h.chatSvc.GetChatMessages(r.Context(), convID, limit, beforeID)
+	messages, hasMore, err := h.chatSvc.GetChatMessages(r.Context(), convID, currentUserID, limit, beforeID)
 	if err != nil {
 		http.Error(w, "Failed to fetch messages", http.StatusInternalServerError)
 		return

@@ -42,6 +42,7 @@ func (h *Hub) Run() {
 			h.clients[client.UserID][client] = true
 			h.mu.Unlock()
 			log.Printf("User %d connected. Total sessions for user: %d\n", client.UserID, len(h.clients[client.UserID]))
+			go h.DeliverOfflineMessagesOnConnect(client.UserID)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
@@ -148,31 +149,34 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			return
 		}
 
-		msg := &models.Message{
-			ConversationID: p.ConversationID,
-			SenderID:       client.UserID,
-			SenderName:     client.UserName,
-			SenderAvatar:   client.AvatarURL,
-			MessageType:    models.MessageType(p.MessageType),
-			Content:        p.Content,
-		}
-
 		ctx := context.Background()
 
-		// ১. ডেটাবেসে মেসেজ ও লাস্ট মেসেজ সেভ
+		convType, _ := h.chatRepo.GetConversationType(ctx, p.ConversationID)
+		if convType == "" {
+			convType = "direct"
+		}
+
+		msg := &models.Message{
+			ConversationID:   p.ConversationID,
+			ConversationType: convType,
+			SenderID:         client.UserID,
+			SenderName:       client.UserName,
+			SenderAvatar:     client.AvatarURL,
+			MessageType:      models.MessageType(p.MessageType),
+			Content:          p.Content,
+		}
+
+		// ১. ডেটাবেসে মেসেজ ও লাস্ট মেসেজ সেভ (সেন্ডারের read ও delivered ওয়াটারমার্ক সহ)
 		if err := h.chatRepo.SaveMessage(ctx, msg); err != nil {
 			log.Println("Failed to save message:", err)
 			return
 		}
 
-		// সেন্ডারের নিজের ওয়াটারমার্কও তাৎক্ষণিকভাবে এই মেসেজে আপডেট করা
-		_ = h.chatRepo.UpdateLastReadWatermark(ctx, p.ConversationID, client.UserID, msg.ID)
-
-		// ২. প্রেরককে 'Sent' স্ট্যাটাস হিসেবে পাঠানো
+		// ২. প্রেরককে 'Sent' স্ট্যাটাস হিসেবে পাঠানো (Single Tick)
 		h.SendDirect(client.UserID, EventNewMessage, msg)
 
 		// ৩. কনভারসেশনের বাকি মেম্বারদের খুঁজে বের করে লাইভ মেসেজ পাঠানো
-		members, err := h.chatRepo.GetConversationMemberIDs(context.Background(), p.ConversationID)
+		members, err := h.chatRepo.GetConversationMemberIDs(ctx, p.ConversationID)
 		if err != nil {
 			log.Println("Error fetching members:", err)
 			return
@@ -185,36 +189,51 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			}
 		}
 
-		// গ্রুপে অন্য ইউজারদের কাছে মেসেজ পাঠানো মাত্রই সেন্ডারের জন্য delivered স্ট্যাটাস পাঠানো
-		if len(members) > 1 {
-			_ = h.chatRepo.MarkMessageDelivered(ctx, msg.ID, client.UserID)
-			h.SendDirect(client.UserID, EventStatusUpdated, map[string]any{
-				"conversation_id": p.ConversationID,
-				"upto_message_id": msg.ID,
-				"status":          "delivered",
-			})
-		}
-
 	case EventAckDelivered:
 		var ack AckPayload
 		if err := json.Unmarshal(event.Payload, &ack); err != nil {
 			return
 		}
+		if ack.MessageID <= 0 || ack.ConversationID == "" {
+			return
+		}
 
-		// 1. DB-te delivered status mark kora
-		_ = h.chatRepo.MarkMessageDelivered(context.Background(), ack.MessageID, client.UserID)
+		ctx := context.Background()
 
-		// 2. Sender-ke double tick notify kora
-		h.SendDirect(ack.SenderID, EventStatusUpdated, map[string]any{
-			"conversation_id": ack.ConversationID,
-			"message_id":      ack.MessageID,
-			"status":          "delivered",
-			"by_user":         client.UserID,
-		})
+		// 1. এই ইউজারের delivered watermark এবং receipt টেবিলে আপডেট
+		_ = h.chatRepo.UpdateLastDeliveredWatermark(ctx, ack.ConversationID, client.UserID, ack.MessageID)
+		_ = h.chatRepo.MarkMessageDelivered(ctx, ack.MessageID, client.UserID)
+
+		// 2. WhatsApp রুল: কনভারসেশনের বাকি সকল মেম্বার মেসেজটি পেয়েছে কি না চেক
+		allDelivered, err := h.chatRepo.AreAllMembersDeliveredUpto(ctx, ack.ConversationID, ack.SenderID, ack.MessageID)
+		if err == nil && allDelivered {
+			targetSenderID := ack.SenderID
+			if targetSenderID > 0 {
+				h.SendDirect(targetSenderID, EventStatusUpdated, map[string]any{
+					"conversation_id": ack.ConversationID,
+					"upto_message_id": ack.MessageID,
+					"status":          "delivered",
+				})
+			} else {
+				members, _ := h.chatRepo.GetConversationMemberIDs(ctx, ack.ConversationID)
+				for _, mID := range members {
+					if mID != client.UserID {
+						h.SendDirect(mID, EventStatusUpdated, map[string]any{
+							"conversation_id": ack.ConversationID,
+							"upto_message_id": ack.MessageID,
+							"status":          "delivered",
+						})
+					}
+				}
+			}
+		}
 
 	case EventAckSeen:
 		var ack AckPayload
 		if err := json.Unmarshal(event.Payload, &ack); err != nil {
+			return
+		}
+		if ack.MessageID <= 0 || ack.ConversationID == "" {
 			return
 		}
 		log.Printf(
@@ -227,10 +246,8 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 
 		ctx := context.Background()
 
-		// ১. Messages টেবিলে রেঞ্জ সিন স্ট্যাটাস আপডেট
+		// ১. Messages টেবিলে রেঞ্জ সিন স্ট্যাটাস এবং ওয়াটারমার্ক (read + delivered) আপডেট
 		_ = h.chatRepo.MarkMessagesSeenUpto(ctx, ack.ConversationID, client.UserID, ack.MessageID)
-
-		// ২. conversation_members টেবিলে ওয়াটারমার্ক পয়েন্টার আপডেট
 		_ = h.chatRepo.UpdateLastReadWatermark(ctx, ack.ConversationID, client.UserID, ack.MessageID)
 
 		log.Printf(
@@ -239,35 +256,45 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			ack.MessageID,
 			ack.ConversationID,
 		)
-		// ৩. মেম্বারদের লাইভ বাবল ও সিন স্ট্যাটাস ব্রডকাস্ট
+
+		// ২. মেম্বারদের লাইভ বাবল ওয়াটারমার্ক ব্রডকাস্ট (কার কার পড়া শেষ তা ছোট Avatar দিয়ে দেখানোর জন্য)
 		members, err := h.chatRepo.GetConversationMemberIDs(ctx, ack.ConversationID)
-		if err != nil {
-			return
+		if err == nil {
+			watermarkPayload := map[string]any{
+				"conversation_id":      ack.ConversationID,
+				"user_id":              client.UserID,
+				"user_name":            client.UserName,  // cached at connect time
+				"user_avatar":          client.AvatarURL, // cached at connect time
+				"last_read_message_id": ack.MessageID,
+			}
+
+			for _, memberID := range members {
+				if memberID != client.UserID {
+					h.SendDirect(memberID, EventMemberReadWatermark, watermarkPayload)
+				}
+			}
 		}
 
-		watermarkPayload := map[string]any{
-			"conversation_id":      ack.ConversationID,
-			"user_id":              client.UserID,
-			"user_name":            client.UserName,  // cached at connect time
-			"user_avatar":          client.AvatarURL, // cached at connect time
-			"last_read_message_id": ack.MessageID,
-		}
-
-		for _, memberID := range members {
-			if memberID != client.UserID {
-				log.Printf(
-					"[WATERMARK_BROADCAST] reader=%d message=%d -> member=%d",
-					client.UserID,
-					ack.MessageID,
-					memberID,
-				)
-				h.SendDirect(memberID, EventStatusUpdated, map[string]any{
+		// ৩. WhatsApp রুল: কনভারসেশনের বাকি সকল মেম্বার সিন করেছে কি না চেক (সবাই সিন করলেই Double Blue Tick)
+		allRead, err := h.chatRepo.AreAllMembersReadUpto(ctx, ack.ConversationID, ack.SenderID, ack.MessageID)
+		if err == nil && allRead {
+			targetSenderID := ack.SenderID
+			if targetSenderID > 0 {
+				h.SendDirect(targetSenderID, EventStatusUpdated, map[string]any{
 					"conversation_id": ack.ConversationID,
 					"upto_message_id": ack.MessageID,
 					"status":          "seen",
-					"by_user":         client.UserID,
 				})
-				h.SendDirect(memberID, EventMemberReadWatermark, watermarkPayload)
+			} else if members != nil {
+				for _, mID := range members {
+					if mID != client.UserID {
+						h.SendDirect(mID, EventStatusUpdated, map[string]any{
+							"conversation_id": ack.ConversationID,
+							"upto_message_id": ack.MessageID,
+							"status":          "seen",
+						})
+					}
+				}
 			}
 		}
 
@@ -282,5 +309,39 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			"signal_data":  callPayload.SignalData,
 			"is_video":     callPayload.IsVideo,
 		})
+	}
+}
+
+// DeliverOfflineMessagesOnConnect automatically marks offline messages as delivered
+// when a user comes online and establishes a WebSocket connection.
+func (h *Hub) DeliverOfflineMessagesOnConnect(userID int) {
+	ctx := context.Background()
+	results, err := h.chatRepo.SyncUserDelivery(ctx, userID)
+	if err != nil || len(results) == 0 {
+		return
+	}
+
+	for _, res := range results {
+		log.Printf("[OFFLINE_DELIVERY_SYNC] user=%d conv=%s upto=%d sender=%d", userID, res.ConversationID, res.UptoMessageID, res.SenderID)
+		if res.SenderID > 0 {
+			h.SendDirect(res.SenderID, EventStatusUpdated, map[string]any{
+				"conversation_id": res.ConversationID,
+				"upto_message_id": res.UptoMessageID,
+				"status":          "delivered",
+			})
+		} else {
+			members, err := h.chatRepo.GetConversationMemberIDs(ctx, res.ConversationID)
+			if err == nil {
+				for _, mID := range members {
+					if mID != userID {
+						h.SendDirect(mID, EventStatusUpdated, map[string]any{
+							"conversation_id": res.ConversationID,
+							"upto_message_id": res.UptoMessageID,
+							"status":          "delivered",
+						})
+					}
+				}
+			}
+		}
 	}
 }

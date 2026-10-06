@@ -11,14 +11,17 @@ const (
 )
 
 type Message struct {
-	ID             int64       `json:"id"`
-	ConversationID string      `json:"conversation_id"`
-	SenderID       int         `json:"sender_id"`
-	SenderName     string      `json:"sender_name,omitempty"`
-	SenderAvatar   string      `json:"sender_avatar,omitempty"`
-	MessageType    MessageType `json:"message_type"`
-	Content        string      `json:"content"`
-	CreatedAt      time.Time   `json:"created_at"`
+	ID               int64       `json:"id"`
+	ConversationID   string      `json:"conversation_id"`
+	ConversationType string      `json:"conversation_type,omitempty"`
+	SenderID         int         `json:"sender_id"`
+	SenderName       string      `json:"sender_name,omitempty"`
+	SenderAvatar     string      `json:"sender_avatar,omitempty"`
+	MessageType      MessageType `json:"message_type"`
+	Content          string      `json:"content"`
+	CreatedAt        time.Time   `json:"created_at"`
+	IsDelivered      bool        `json:"is_delivered"`
+	IsSeen           bool        `json:"is_seen"`
 }
 
 // ReadReceiptUser: Jei member read koreche tar minimal profile

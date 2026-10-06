@@ -15,12 +15,19 @@ type Conversation struct {
 	Type                ConversationType `json:"type"`
 	Title               *string          `json:"title,omitempty"` // Group title
 	AvatarURL           *string          `json:"avatar_url,omitempty"`
+	LastMessageID       *int64           `json:"last_message_id,omitempty"`
 	LastMessageContent  *string          `json:"last_message_content,omitempty"`
 	LastMessageSenderID *int             `json:"last_message_sender_id,omitempty"`
 	LastMessageAt       *time.Time       `json:"last_message_at,omitempty"`
 	UnreadCount         int              `json:"unread_count"`
 	OtherUserID         *int             `json:"other_user_id,omitempty"`
 	CreatedAt           time.Time        `json:"created_at"`
+}
+
+type DeliverySyncResult struct {
+	ConversationID string `json:"conversation_id"`
+	UptoMessageID  int64  `json:"upto_message_id"`
+	SenderID       int    `json:"sender_id"`
 }
 
 type ConversationMember struct {

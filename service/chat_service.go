@@ -11,13 +11,14 @@ type ChatService interface {
 	GetOrCreateDirectChat(ctx context.Context, currentUserID, targetUserID int) (string, error)
 	CreateGroupChat(ctx context.Context, title string, creatorID int, memberIDs []int) (string, error)
 	GetMyConversations(ctx context.Context, userID int) ([]models.Conversation, error)
-	GetChatMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, bool, error)
+	GetChatMessages(ctx context.Context, convID string, currentUserID int, limit int, beforeID int64) ([]models.Message, bool, error)
 	AddMemberToGroup(ctx context.Context, convID string, targetUserID int, requesterID int) error
 	UpdateGroupAvatar(ctx context.Context, convID string, avatarURL string, requesterID int) error
 	GetConversationMembers(ctx context.Context, convID string, requesterID int) ([]models.ConversationMemberProfile, error)
 	RemoveMemberFromGroup(ctx context.Context, convID string, targetUserID int) error
 	UpdateLastReadWatermark(ctx context.Context, convID string, userID int, messageID int64) error
 	GetGroupReadWatermarks(ctx context.Context, convID string, minMessageID int64) (map[int64][]models.ReadReceiptUser, error)
+	SyncUserDelivery(ctx context.Context, userID int) ([]models.DeliverySyncResult, error)
 }
 
 type chatService struct {
@@ -36,11 +37,11 @@ func (s *chatService) GetMyConversations(ctx context.Context, userID int) ([]mod
 	return s.chatRepo.GetUserConversations(ctx, userID)
 }
 
-func (s *chatService) GetChatMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, bool, error) {
+func (s *chatService) GetChatMessages(ctx context.Context, convID string, currentUserID int, limit int, beforeID int64) ([]models.Message, bool, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	return s.chatRepo.GetConversationMessages(ctx, convID, limit, beforeID)
+	return s.chatRepo.GetConversationMessages(ctx, convID, currentUserID, limit, beforeID)
 }
 
 // Service Struct-e method implement korun:
@@ -90,4 +91,8 @@ func (s *chatService) UpdateLastReadWatermark(ctx context.Context, convID string
 }
 func (s *chatService) GetGroupReadWatermarks(ctx context.Context, convID string, minMessageID int64) (map[int64][]models.ReadReceiptUser, error) {
 	return s.chatRepo.GetGroupReadWatermarks(ctx, convID, minMessageID)
+}
+
+func (s *chatService) SyncUserDelivery(ctx context.Context, userID int) ([]models.DeliverySyncResult, error) {
+	return s.chatRepo.SyncUserDelivery(ctx, userID)
 }

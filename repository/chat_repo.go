@@ -18,13 +18,14 @@ type ChatRepository interface {
 	GetUserConversations(ctx context.Context, userID int) ([]models.Conversation, error)
 
 	// Chat screen inside: Messages with pagination
-	GetConversationMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, bool, error)
+	GetConversationMessages(ctx context.Context, convID string, currentUserID int, limit int, beforeID int64) ([]models.Message, bool, error)
 
 	// Direct chat find or create helper
 	GetOrCreateDirectConversation(ctx context.Context, user1, user2 int) (string, error)
 
 	// Notun: Conversation-er sokol member ID ber kora
 	GetConversationMemberIDs(ctx context.Context, convID string) ([]int, error)
+	GetConversationType(ctx context.Context, convID string) (string, error)
 
 	MarkMessageDelivered(ctx context.Context, messageID int64, userID int) error
 	MarkMessagesSeenUpto(ctx context.Context, convID string, userID int, uptoMessageID int64) error
@@ -34,7 +35,11 @@ type ChatRepository interface {
 	RemoveGroupMember(ctx context.Context, convID string, userID int) error
 
 	UpdateLastReadWatermark(ctx context.Context, convID string, userID int, messageID int64) error
+	UpdateLastDeliveredWatermark(ctx context.Context, convID string, userID int, messageID int64) error
+	AreAllMembersDeliveredUpto(ctx context.Context, convID string, senderID int, messageID int64) (bool, error)
+	AreAllMembersReadUpto(ctx context.Context, convID string, senderID int, messageID int64) (bool, error)
 	GetGroupReadWatermarks(ctx context.Context, convID string, minMessageID int64) (map[int64][]models.ReadReceiptUser, error)
+	SyncUserDelivery(ctx context.Context, userID int) ([]models.DeliverySyncResult, error)
 }
 
 type chatRepo struct {
@@ -63,18 +68,19 @@ func (r *chatRepo) SaveMessage(ctx context.Context, msg *models.Message) error {
 
 	// 2. Update conversation head cache
 	headQuery := `UPDATE conversations 
-	              SET last_message_content = $1,
-	                  last_message_sender_id = $2,
-	                  last_message_at = $3
-	              WHERE id = $4`
-	res, err := tx.ExecContext(ctx, headQuery, msg.Content, msg.SenderID, msg.CreatedAt, msg.ConversationID)
+	              SET last_message_id = $1,
+	                  last_message_content = $2,
+	                  last_message_sender_id = $3,
+	                  last_message_at = $4
+	              WHERE id = $5`
+	res, err := tx.ExecContext(ctx, headQuery, msg.ID, msg.Content, msg.SenderID, msg.CreatedAt, msg.ConversationID)
 	if err != nil {
 		return err
 	}
 
-	// 3. Auto-update sender's own read watermark to the message they just sent!
+	// 3. Auto-update sender's own read & delivered watermark to the message they just sent!
 	watermarkQuery := `UPDATE conversation_members
-					   SET last_read_message_id = $1
+					   SET last_read_message_id = $1, last_delivered_message_id = $1
 					   WHERE conversation_id = $2 AND user_id = $3`
 	_, err = tx.ExecContext(ctx, watermarkQuery, msg.ID, msg.ConversationID, msg.SenderID)
 	if err != nil {
@@ -96,6 +102,7 @@ func (r *chatRepo) GetUserConversations(ctx context.Context, userID int) ([]mode
 				c.type, 
 				CASE WHEN c.type = 'direct' THEN u2.name ELSE c.title END as title,
 				CASE WHEN c.type = 'direct' THEN u2.avatar_url ELSE c.avatar_url END as avatar_url,
+				c.last_message_id,
 				c.last_message_content, 
 				c.last_message_sender_id, 
 				c.last_message_at, 
@@ -120,7 +127,7 @@ func (r *chatRepo) GetUserConversations(ctx context.Context, userID int) ([]mode
 		var c models.Conversation
 		if err := rows.Scan(
 			&c.ID, &c.Type, &c.Title, &c.AvatarURL,
-			&c.LastMessageContent, &c.LastMessageSenderID, &c.LastMessageAt,
+			&c.LastMessageID, &c.LastMessageContent, &c.LastMessageSenderID, &c.LastMessageAt,
 			&c.OtherUserID, &c.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -131,22 +138,35 @@ func (r *chatRepo) GetUserConversations(ctx context.Context, userID int) ([]mode
 	return convs, rows.Err()
 }
 
-func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, limit int, beforeID int64) ([]models.Message, bool, error) {
+func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, currentUserID int, limit int, beforeID int64) ([]models.Message, bool, error) {
 	// 1. Default limit set করা (যাতে কেউ একসাথে অনেক ডেটা রিকোয়েস্ট করে সার্ভার ডাউন না করতে পারে)
 	if limit <= 0 || limit > 50 {
 		limit = 20
 	}
 
 	// 2. Pagination Peek: আমরা লিমিটের চেয়ে ১টি মেসেজ বেশি আনব (limit + 1)। 
-	// এই অতিরিক্ত মেসেজটি দিয়ে আমরা বুঝতে পারব যে ডেটাবেসে আরও পুরানো মেসেজ (Next Page) আছে কি না।
 	fetchLimit := limit + 1
+
+	var convType string
+	var minDelivered, minRead int64
+	statusQuery := `
+		SELECT 
+			c.type,
+			COALESCE(MIN(cm.last_delivered_message_id), 0) AS min_delivered,
+			COALESCE(MIN(cm.last_read_message_id), 0) AS min_read
+		FROM conversations c
+		LEFT JOIN conversation_members cm ON c.id = cm.conversation_id AND cm.user_id != $2
+		WHERE c.id = $1
+		GROUP BY c.id, c.type
+	`
+	_ = r.db.QueryRowContext(ctx, statusQuery, convID, currentUserID).Scan(&convType, &minDelivered, &minRead)
+	if convType == "" {
+		convType = "direct"
+	}
 
 	var query string
 	var args []any
 
-	// 3. Query Optimization:
-	// আমরা সরাসরি JOIN না করে, আগে sub-query তে LIMIT অ্যাপ্লাই করেছি।
-	// এতে করে ডেটাবেসকে শুধু limit (যেমন 21) টা row এর সাথেই users টেবিল JOIN করতে হবে, যা অনেক ফাস্ট!
 	if beforeID > 0 {
 		query = `
 			SELECT sub.id, sub.conversation_id, sub.sender_id, u.name, COALESCE(u.avatar_url, ''), sub.message_type, sub.content, sub.created_at
@@ -187,6 +207,11 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, l
 		if err := rows.Scan(&m.ID, &m.ConversationID, &m.SenderID, &m.SenderName, &m.SenderAvatar, &m.MessageType, &m.Content, &m.CreatedAt); err != nil {
 			return nil, false, err
 		}
+		m.ConversationType = convType
+		if m.SenderID == currentUserID {
+			m.IsSeen = minRead > 0 && m.ID <= minRead
+			m.IsDelivered = m.IsSeen || (minDelivered > 0 && m.ID <= minDelivered)
+		}
 		msgs = append(msgs, m)
 	}
 
@@ -198,9 +223,6 @@ func (r *chatRepo) GetConversationMessages(ctx context.Context, convID string, l
 	hasMore := false
 	if len(msgs) > limit {
 		hasMore = true
-		// কোয়েরিটি DESC (Descending) অর্ডারে ডেটা দিচ্ছে (সবচেয়ে নতুনটি শুরুতে)।
-		// তাই ১টি এক্সট্রা যে ডেটা এসেছিল সেটি আছে অ্যারের একদম শেষে।
-		// msgs[:limit] ব্যবহার করে আমরা অ্যারের শেষের সেই এক্সট্রা ডেটাটি বাদ দিয়ে দিচ্ছি।
 		msgs = msgs[:limit]
 	}
 	
@@ -349,17 +371,69 @@ func (r *chatRepo) RemoveGroupMember(ctx context.Context, convID string, userID 
 	return nil
 }
 
-// UpdateLastReadWatermark: ইউজারের সর্বশেষ পঠিত মেসেজের পয়েন্টার আপডেট করে
+// UpdateLastReadWatermark: ইউজারের সর্বশেষ পঠিত মেসেজের পয়েন্টার আপডেট করে (এবং ডেলিভার্ড পয়েন্টারও)
 func (r *chatRepo) UpdateLastReadWatermark(ctx context.Context, convID string, userID int, messageID int64) error {
 	query := `
 		UPDATE conversation_members
-		SET last_read_message_id = $1
+		SET last_read_message_id = $1,
+		    last_delivered_message_id = GREATEST(last_delivered_message_id, $1)
 		WHERE conversation_id = $2 
 		  AND user_id = $3 
 		  AND last_read_message_id < $1` // পয়েন্টার যাতে পেছনের দিকে না নামে
 
 	_, err := r.db.ExecContext(ctx, query, messageID, convID, userID)
 	return err
+}
+
+func (r *chatRepo) UpdateLastDeliveredWatermark(ctx context.Context, convID string, userID int, messageID int64) error {
+	query := `
+		UPDATE conversation_members
+		SET last_delivered_message_id = $1
+		WHERE conversation_id = $2 
+		  AND user_id = $3 
+		  AND last_delivered_message_id < $1`
+
+	_, err := r.db.ExecContext(ctx, query, messageID, convID, userID)
+	return err
+}
+
+func (r *chatRepo) AreAllMembersDeliveredUpto(ctx context.Context, convID string, senderID int, messageID int64) (bool, error) {
+	if senderID <= 0 {
+		_ = r.db.QueryRowContext(ctx, `SELECT sender_id FROM messages WHERE id = $1`, messageID).Scan(&senderID)
+	}
+	query := `
+		SELECT NOT EXISTS (
+			SELECT 1 FROM conversation_members
+			WHERE conversation_id = $1
+			  AND user_id != $2
+			  AND last_delivered_message_id < $3
+		)`
+	var allDelivered bool
+	err := r.db.QueryRowContext(ctx, query, convID, senderID, messageID).Scan(&allDelivered)
+	return allDelivered, err
+}
+
+func (r *chatRepo) AreAllMembersReadUpto(ctx context.Context, convID string, senderID int, messageID int64) (bool, error) {
+	if senderID <= 0 {
+		_ = r.db.QueryRowContext(ctx, `SELECT sender_id FROM messages WHERE id = $1`, messageID).Scan(&senderID)
+	}
+	query := `
+		SELECT NOT EXISTS (
+			SELECT 1 FROM conversation_members
+			WHERE conversation_id = $1
+			  AND user_id != $2
+			  AND last_read_message_id < $3
+		)`
+	var allRead bool
+	err := r.db.QueryRowContext(ctx, query, convID, senderID, messageID).Scan(&allRead)
+	return allRead, err
+}
+
+func (r *chatRepo) GetConversationType(ctx context.Context, convID string) (string, error) {
+	query := `SELECT type FROM conversations WHERE id = $1`
+	var convType string
+	err := r.db.QueryRowContext(ctx, query, convID).Scan(&convType)
+	return convType, err
 }
 
 // GetGroupReadWatermarks: কোন মেসেজ আইডিতে কোন কোন ইউজার অবস্থান করছে তা রিটার্ন করে
@@ -445,4 +519,58 @@ func (r *chatRepo) GetUserRoleInConversation(ctx context.Context, convID string,
 		return "", err
 	}
 	return role, nil
+}
+
+func (r *chatRepo) SyncUserDelivery(ctx context.Context, userID int) ([]models.DeliverySyncResult, error) {
+	// 1. Find all conversations for this user where the latest message in the conversation
+	// is greater than this user's last_delivered_message_id (meaning new messages landed while offline)
+	query := `
+		SELECT 
+			c.id, 
+			c.last_message_id, 
+			COALESCE(c.last_message_sender_id, 0)
+		FROM conversation_members cm
+		JOIN conversations c ON cm.conversation_id = c.id
+		WHERE cm.user_id = $1 
+		  AND c.last_message_id > cm.last_delivered_message_id
+		  AND c.last_message_id > 0
+	`
+	rows, err := r.db.QueryContext(ctx, query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type pendingSync struct {
+		convID    string
+		lastMsgID int64
+		senderID  int
+	}
+	var pending []pendingSync
+
+	for rows.Next() {
+		var p pendingSync
+		if err := rows.Scan(&p.convID, &p.lastMsgID, &p.senderID); err == nil {
+			pending = append(pending, p)
+		}
+	}
+
+	var results []models.DeliverySyncResult
+
+	for _, p := range pending {
+		// Update this user's delivered watermark in DB
+		_ = r.UpdateLastDeliveredWatermark(ctx, p.convID, userID, p.lastMsgID)
+
+		// Check if ALL other members in this conversation have now received up to this message
+		allDelivered, err := r.AreAllMembersDeliveredUpto(ctx, p.convID, p.senderID, p.lastMsgID)
+		if err == nil && allDelivered {
+			results = append(results, models.DeliverySyncResult{
+				ConversationID: p.convID,
+				UptoMessageID:  p.lastMsgID,
+				SenderID:       p.senderID,
+			})
+		}
+	}
+
+	return results, nil
 }
