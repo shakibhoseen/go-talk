@@ -260,3 +260,31 @@ func (h *AuthHandler) UpdateBio(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"message": "Bio updated successfully"})
 }
+
+// GET /users
+func (h *AuthHandler) GetUsers(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	parts := strings.Split(authHeader, " ")
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		http.Error(w, "Unauthorized: invalid authorization header", http.StatusUnauthorized)
+		return
+	}
+
+	userID, err := h.authSvc.ValidateToken(parts[1])
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	users, err := h.authSvc.GetAllUsers(r.Context(), userID)
+	if err != nil {
+		http.Error(w, "Failed to fetch users: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"users": users,
+	})
+}
+

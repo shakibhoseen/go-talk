@@ -46,6 +46,7 @@ type ConversationMemberProfile struct {
 	Name           string    `json:"name"`
 	Email          string    `json:"email"`
 	AvatarURL      *string   `json:"avatar_url,omitempty"`
+	Bio            *string   `json:"bio,omitempty"`
 }
 
 type UpdateGroupAvatarRequest struct {
@@ -53,6 +54,7 @@ type UpdateGroupAvatarRequest struct {
 }
 
 type AddGroupMemberRequest struct {
-	UserID int    `json:"user_id"`
-	Role   string `json:"role"` // default "member"
+	UserID       int    `json:"user_id"`
+	TargetUserID int    `json:"target_user_id,omitempty"`
+	Role         string `json:"role"` // default "member"
 }

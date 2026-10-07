@@ -166,6 +166,13 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 
 		ctx := context.Background()
 
+		// Authorization: check conversation membership
+		isMember, err := h.chatRepo.IsConversationMember(ctx, p.ConversationID, client.UserID)
+		if err != nil || !isMember {
+			log.Printf("[SECURITY] User %d is not a member of conversation %s; rejecting send_message", client.UserID, p.ConversationID)
+			return
+		}
+
 		convType, _ := h.chatRepo.GetConversationType(ctx, p.ConversationID)
 		if convType == "" {
 			convType = "direct"
@@ -238,11 +245,18 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			return
 		}
 
-		// 3. Update delivered watermark and message receipt
-		_ = h.chatRepo.UpdateLastDeliveredWatermark(ctx, ack.ConversationID, client.UserID, ack.MessageID)
-		_ = h.chatRepo.MarkMessageDelivered(ctx, ack.MessageID, client.UserID)
+		// 3. Atomically update delivered watermark and message receipt in a single transaction
+		advanced, err := h.chatRepo.ProcessAckDelivered(ctx, ack.ConversationID, client.UserID, ack.MessageID)
+		if err != nil {
+			log.Printf("[ERROR] Failed to process ack_delivered for user %d msg %d: %v", client.UserID, ack.MessageID, err)
+			return
+		}
 
-		// 4. Check if all members have received up to messageID
+		// 4. Check if all members have received up to messageID (only if watermark advanced)
+		if !advanced {
+			return
+		}
+
 		allDelivered, err := h.chatRepo.AreAllMembersDeliveredUpto(ctx, ack.ConversationID, actualSenderID, ack.MessageID)
 		if err == nil && allDelivered {
 			targetSenderID := actualSenderID
@@ -300,9 +314,18 @@ func (h *Hub) RouteIncomingEvent(client *Client, raw []byte) {
 			actualSenderID,
 		)
 
-		// 3. Update seen status in range and watermarks
-		_ = h.chatRepo.MarkMessagesSeenUpto(ctx, ack.ConversationID, client.UserID, ack.MessageID)
-		_ = h.chatRepo.UpdateLastReadWatermark(ctx, ack.ConversationID, client.UserID, ack.MessageID)
+		// 3. Atomically update seen status in range and watermarks in a single transaction
+		advanced, err := h.chatRepo.ProcessAckSeen(ctx, ack.ConversationID, client.UserID, ack.MessageID)
+		if err != nil {
+			log.Printf("[ERROR] Failed to process ack_seen for user %d msg %d: %v", client.UserID, ack.MessageID, err)
+			return
+		}
+
+		// Only broadcast watermark and status update if the watermark actually advanced forward!
+		if !advanced {
+			log.Printf("[ACK_SEEN_NOOP] Watermark did not advance for user %d msg %d in conv %s", client.UserID, ack.MessageID, ack.ConversationID)
+			return
+		}
 
 		log.Printf(
 			"[WATERMARK] user=%d -> message=%d conversation=%s",

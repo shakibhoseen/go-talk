@@ -46,6 +46,7 @@ func main() {
 	mux.HandleFunc("POST /auth/refresh", authHandler.RefreshToken) // নতুন
 	mux.HandleFunc("POST /auth/logout", authHandler.Logout)        // নতুন
 	mux.HandleFunc("GET /users/me", authHandler.GetMe)
+	mux.HandleFunc("GET /users", authHandler.GetUsers)
 	mux.HandleFunc("PUT /users/me/name", authHandler.UpdateName)
 	mux.HandleFunc("PUT /users/me/bio", authHandler.UpdateBio)
 	mux.HandleFunc("POST /users/me/avatar", authHandler.UploadAvatar)

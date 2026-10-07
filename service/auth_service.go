@@ -21,6 +21,7 @@ type AuthService interface {
 	UpdateUserBio(ctx context.Context, userID int, bio string) error
 	RefreshToken(ctx context.Context, req *models.RefreshRequest) (*models.AuthResponse, error)
 	Logout(ctx context.Context, req *models.RefreshRequest) error
+	GetAllUsers(ctx context.Context, excludeUserID int) ([]models.User, error)
 }
 
 type authService struct {
@@ -151,3 +152,15 @@ func (s *authService) RefreshToken(ctx context.Context, req *models.RefreshReque
 func (s *authService) Logout(ctx context.Context, req *models.RefreshRequest) error {
 	return s.userRepo.DeleteRefreshToken(ctx, req.RefreshToken)
 }
+
+func (s *authService) GetAllUsers(ctx context.Context, excludeUserID int) ([]models.User, error) {
+	users, err := s.userRepo.GetAllUsers(ctx, excludeUserID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range users {
+		users[i].PasswordHash = ""
+	}
+	return users, nil
+}
+

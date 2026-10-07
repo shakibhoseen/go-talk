@@ -41,7 +41,9 @@ func TestIdempotencyAndClientMessageID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create u1: %v", err)
 	}
-	defer db.Exec(`DELETE FROM users WHERE id IN ($1, $2)`, u1, u2)
+	defer func() {
+		_, _ = db.Exec(`DELETE FROM users WHERE id IN ($1, $2)`, u1, u2)
+	}()
 
 	err = db.QueryRow(`INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id`,
 		"Idemp U2", fmt.Sprintf("idemp_u2_%d@test.com", now+1), "hash").Scan(&u2)

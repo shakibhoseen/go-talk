@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"go-talk/models"
 	"go-talk/repository"
@@ -15,7 +16,7 @@ type ChatService interface {
 	AddMemberToGroup(ctx context.Context, convID string, targetUserID int, requesterID int) error
 	UpdateGroupAvatar(ctx context.Context, convID string, avatarURL string, requesterID int) error
 	GetConversationMembers(ctx context.Context, convID string, requesterID int) ([]models.ConversationMemberProfile, error)
-	RemoveMemberFromGroup(ctx context.Context, convID string, targetUserID int) error
+	RemoveMemberFromGroup(ctx context.Context, convID string, targetUserID int, requesterID int) error
 	UpdateLastReadWatermark(ctx context.Context, convID string, userID int, messageID int64) error
 	GetGroupReadWatermarks(ctx context.Context, convID string, minMessageID int64) (map[int64][]models.ReadReceiptUser, error)
 	SyncUserDelivery(ctx context.Context, userID int) ([]models.DeliverySyncResult, error)
@@ -53,36 +54,112 @@ func (s *chatService) CreateGroupChat(ctx context.Context, title string, creator
 }
 
 func (s *chatService) AddMemberToGroup(ctx context.Context, convID string, targetUserID int, requesterID int) error {
+	convType, err := s.chatRepo.GetConversationType(ctx, convID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return repository.ErrConversationNotFound
+		}
+		return err
+	}
+	if convType != "group" {
+		return repository.ErrNotGroup
+	}
+
 	role, err := s.chatRepo.GetUserRoleInConversation(ctx, convID, requesterID)
 	if err != nil {
 		return err
 	}
 	if role != "admin" {
-		return errors.New("only admins can add members")
+		return repository.ErrNotAdmin
 	}
 	return s.chatRepo.AddGroupMember(ctx, convID, targetUserID, "member")
 }
 
 func (s *chatService) UpdateGroupAvatar(ctx context.Context, convID string, avatarURL string, requesterID int) error {
+	convType, err := s.chatRepo.GetConversationType(ctx, convID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return repository.ErrConversationNotFound
+		}
+		return err
+	}
+	if convType != "group" {
+		return repository.ErrNotGroup
+	}
+
 	role, err := s.chatRepo.GetUserRoleInConversation(ctx, convID, requesterID)
 	if err != nil {
 		return err
 	}
 	if role != "admin" {
-		return errors.New("only admins can update group avatar")
+		return repository.ErrNotAdmin
 	}
 	return s.chatRepo.UpdateGroupAvatar(ctx, convID, avatarURL)
 }
 
 func (s *chatService) GetConversationMembers(ctx context.Context, convID string, requesterID int) ([]models.ConversationMemberProfile, error) {
-	_, err := s.chatRepo.GetUserRoleInConversation(ctx, convID, requesterID)
+	convType, err := s.chatRepo.GetConversationType(ctx, convID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, repository.ErrConversationNotFound
+		}
+		return nil, err
+	}
+	if convType != "group" {
+		return nil, repository.ErrNotGroup
+	}
+
+	_, err = s.chatRepo.GetUserRoleInConversation(ctx, convID, requesterID)
 	if err != nil {
 		return nil, err
 	}
 	return s.chatRepo.GetConversationMembers(ctx, convID)
 }
 
-func (s *chatService) RemoveMemberFromGroup(ctx context.Context, convID string, targetUserID int) error {
+func (s *chatService) RemoveMemberFromGroup(ctx context.Context, convID string, targetUserID int, requesterID int) error {
+	convType, err := s.chatRepo.GetConversationType(ctx, convID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return repository.ErrConversationNotFound
+		}
+		return err
+	}
+	if convType != "group" {
+		return repository.ErrNotGroup
+	}
+
+	requesterRole, err := s.chatRepo.GetUserRoleInConversation(ctx, convID, requesterID)
+	if err != nil {
+		return err
+	}
+
+	targetRole, err := s.chatRepo.GetUserRoleInConversation(ctx, convID, targetUserID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotMember) {
+			return repository.ErrMemberNotFound
+		}
+		return err
+	}
+
+	if requesterRole != "admin" {
+		// Normal member can only remove themselves (leave group)
+		if requesterID != targetUserID {
+			return repository.ErrNotAdmin
+		}
+	} else {
+		// Admin is removing someone
+		if targetRole == "admin" {
+			// Check if removing the last admin
+			adminCount, err := s.chatRepo.GetAdminCountInConversation(ctx, convID)
+			if err != nil {
+				return err
+			}
+			if adminCount <= 1 {
+				return repository.ErrCannotRemoveOnlyAdmin
+			}
+		}
+	}
+
 	return s.chatRepo.RemoveGroupMember(ctx, convID, targetUserID)
 }
 

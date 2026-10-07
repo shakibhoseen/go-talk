@@ -1,18 +1,27 @@
 package handlers
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"go-talk/models"
+	"go-talk/repository"
+	"go-talk/service"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
-	"time"
-	"encoding/json"
-	"go-talk/models"
-	"go-talk/service"
-	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
+
+var uuidRegex = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+func isValidUUID(u string) bool {
+	return uuidRegex.MatchString(u)
+}
 
 type ChatHandler struct {
 	chatSvc service.ChatService
@@ -48,8 +57,13 @@ func (h *ChatHandler) CreateDirectChat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		TargetUserID int `json:"target_user_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TargetUserID == 0 {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TargetUserID <= 0 {
 		http.Error(w, "Invalid target_user_id", http.StatusBadRequest)
+		return
+	}
+
+	if req.TargetUserID == currentUserID {
+		http.Error(w, "Cannot create direct conversation with yourself", http.StatusBadRequest)
 		return
 	}
 
@@ -132,7 +146,6 @@ func (h *ChatHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
 		watermarks = make(map[int64][]models.ReadReceiptUser)
 	}
 
-	const maxVisibleAvatars = 3
 	watermarkMap := make(map[string]models.MessageWatermark)
 
 	for msgID, users := range watermarks {
@@ -140,15 +153,8 @@ func (h *ChatHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		var visibleUsers []models.ReadReceiptUser
-		if len(users) > maxVisibleAvatars {
-			visibleUsers = users[:maxVisibleAvatars]
-		} else {
-			visibleUsers = users
-		}
-
 		watermarkMap[strconv.FormatInt(msgID, 10)] = models.MessageWatermark{
-			Users: visibleUsers,
+			Users: users,
 			Count: len(users),
 		}
 	}
@@ -198,13 +204,30 @@ func (h *ChatHandler) CreateGroupChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(req.MemberIDs) == 0 {
+	trimmedTitle := strings.TrimSpace(req.Title)
+	if trimmedTitle == "" {
+		http.Error(w, "Group title is required", http.StatusBadRequest)
+		return
+	}
+
+	var validMemberIDs []int
+	for _, id := range req.MemberIDs {
+		if id > 0 && id != currentUserID {
+			validMemberIDs = append(validMemberIDs, id)
+		}
+	}
+
+	if len(validMemberIDs) == 0 {
 		http.Error(w, "At least one member is required to create a group", http.StatusBadRequest)
 		return
 	}
 
-	convID, err := h.chatSvc.CreateGroupChat(r.Context(), req.Title, currentUserID, req.MemberIDs)
+	convID, err := h.chatSvc.CreateGroupChat(r.Context(), trimmedTitle, currentUserID, validMemberIDs)
 	if err != nil {
+		if strings.Contains(err.Error(), "foreign key constraint") {
+			http.Error(w, "One or more member IDs do not exist", http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "Failed to create group: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -213,7 +236,7 @@ func (h *ChatHandler) CreateGroupChat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]any{
 		"conversation_id": convID,
-		"title":           req.Title,
+		"title":           trimmedTitle,
 	})
 }
 
@@ -226,20 +249,54 @@ func (h *ChatHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 	}
 
 	convID := r.PathValue("id")
-	if convID == "" {
-		http.Error(w, "Missing conversation id", http.StatusBadRequest)
+	if convID == "" || !isValidUUID(convID) {
+		http.Error(w, "Invalid conversation id", http.StatusBadRequest)
 		return
 	}
 
 	var req struct {
+		UserID       int `json:"user_id"`
 		TargetUserID int `json:"target_user_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TargetUserID == 0 {
-		http.Error(w, "Invalid target_user_id", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
 		return
 	}
 
-	if err := h.chatSvc.AddMemberToGroup(r.Context(), convID, req.TargetUserID, userID); err != nil {
+	targetUID := req.UserID
+	if targetUID == 0 {
+		targetUID = req.TargetUserID
+	}
+	if targetUID <= 0 {
+		http.Error(w, "Invalid target user id", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.chatSvc.AddMemberToGroup(r.Context(), convID, targetUID, userID); err != nil {
+		if errors.Is(err, repository.ErrNotMember) {
+			http.Error(w, "Forbidden: you are not a member of this conversation", http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, repository.ErrNotAdmin) {
+			http.Error(w, "Forbidden: only admins can add members", http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, repository.ErrConversationNotFound) {
+			http.Error(w, "Conversation not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, repository.ErrNotGroup) {
+			http.Error(w, "Conversation is not a group", http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, repository.ErrUserNotFound) {
+			http.Error(w, "Target user not found", http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, repository.ErrAlreadyMember) {
+			http.Error(w, "User is already a member of this conversation", http.StatusConflict)
+			return
+		}
 		http.Error(w, "Failed to add member: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -252,21 +309,50 @@ func (h *ChatHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /conversations/{id}/members/{user_id}
 func (h *ChatHandler) RemoveMember(w http.ResponseWriter, r *http.Request) {
-	_, err := h.extractUserID(r)
+	requesterID, err := h.extractUserID(r)
 	if err != nil {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	convID := r.PathValue("id")
+	if convID == "" || !isValidUUID(convID) {
+		http.Error(w, "Invalid conversation id", http.StatusBadRequest)
+		return
+	}
+
 	userIDStr := r.PathValue("user_id")
 	targetUID, err := strconv.Atoi(userIDStr)
-	if err != nil || targetUID == 0 {
+	if err != nil || targetUID <= 0 {
 		http.Error(w, "Invalid user_id", http.StatusBadRequest)
 		return
 	}
 
-	if err := h.chatSvc.RemoveMemberFromGroup(r.Context(), convID, targetUID); err != nil {
+	if err := h.chatSvc.RemoveMemberFromGroup(r.Context(), convID, targetUID, requesterID); err != nil {
+		if errors.Is(err, repository.ErrNotMember) {
+			http.Error(w, "Forbidden: you are not a member of this conversation", http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, repository.ErrNotAdmin) {
+			http.Error(w, "Forbidden: only admins can remove other members", http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, repository.ErrCannotRemoveOnlyAdmin) {
+			http.Error(w, "Cannot remove the only group admin", http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, repository.ErrMemberNotFound) {
+			http.Error(w, "Member not found in this conversation", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, repository.ErrConversationNotFound) {
+			http.Error(w, "Conversation not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, repository.ErrNotGroup) {
+			http.Error(w, "Conversation is not a group", http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "Failed to remove member: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -285,8 +371,8 @@ func (h *ChatHandler) UpdateGroupAvatar(w http.ResponseWriter, r *http.Request) 
 	}
 
 	convID := r.PathValue("id")
-	if convID == "" {
-		http.Error(w, "Missing conversation id", http.StatusBadRequest)
+	if convID == "" || !isValidUUID(convID) {
+		http.Error(w, "Invalid conversation id", http.StatusBadRequest)
 		return
 	}
 
@@ -333,13 +419,29 @@ func (h *ChatHandler) UpdateGroupAvatar(w http.ResponseWriter, r *http.Request) 
 	avatarURL := fmt.Sprintf("/uploads/groups/%s", filename)
 
 	if err := h.chatSvc.UpdateGroupAvatar(r.Context(), convID, avatarURL, userID); err != nil {
+		if errors.Is(err, repository.ErrNotMember) {
+			http.Error(w, "Forbidden: you are not a member of this conversation", http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, repository.ErrNotAdmin) {
+			http.Error(w, "Forbidden: only admins can update group avatar", http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, repository.ErrConversationNotFound) {
+			http.Error(w, "Conversation not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, repository.ErrNotGroup) {
+			http.Error(w, "Conversation is not a group", http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "Failed to update avatar: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"message": "Group avatar updated successfully",
+		"message":    "Group avatar updated successfully",
 		"avatar_url": avatarURL,
 	})
 }
@@ -352,13 +454,25 @@ func (h *ChatHandler) GetConversationMembers(w http.ResponseWriter, r *http.Requ
 	}
 
 	convID := r.PathValue("id")
-	if convID == "" {
-		http.Error(w, "Missing conversation id", http.StatusBadRequest)
+	if convID == "" || !isValidUUID(convID) {
+		http.Error(w, "Invalid conversation id", http.StatusBadRequest)
 		return
 	}
 
 	members, err := h.chatSvc.GetConversationMembers(r.Context(), convID, userID)
 	if err != nil {
+		if errors.Is(err, repository.ErrNotMember) {
+			http.Error(w, "Forbidden: you are not a member of this conversation", http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, repository.ErrConversationNotFound) {
+			http.Error(w, "Conversation not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, repository.ErrNotGroup) {
+			http.Error(w, "Conversation is not a group", http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "Failed to get members: "+err.Error(), http.StatusInternalServerError)
 		return
 	}

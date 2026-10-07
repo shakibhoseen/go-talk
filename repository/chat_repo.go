@@ -5,14 +5,27 @@ import (
 	"database/sql"
 	"errors"
 	"go-talk/models"
+
+	"github.com/lib/pq"
 )
 
-var ErrClientMessageIDConflict = errors.New("conflict: client_message_id already exists with different content")
+var (
+	ErrClientMessageIDConflict = errors.New("conflict: client_message_id already exists with different content")
+	ErrNotMember               = errors.New("not a member of this conversation")
+	ErrConversationNotFound    = errors.New("conversation not found")
+	ErrNotGroup                = errors.New("conversation is not a group")
+	ErrNotAdmin                = errors.New("only admins can perform this action")
+	ErrUserNotFound            = errors.New("user not found")
+	ErrAlreadyMember           = errors.New("user is already a member of this conversation")
+	ErrMemberNotFound          = errors.New("member not found in this conversation")
+	ErrCannotRemoveOnlyAdmin   = errors.New("cannot remove the only group admin")
+)
 
 type ChatRepository interface {
 	UpdateGroupAvatar(ctx context.Context, convID string, avatarURL string) error
 	GetConversationMembers(ctx context.Context, convID string) ([]models.ConversationMemberProfile, error)
 	GetUserRoleInConversation(ctx context.Context, convID string, userID int) (string, error)
+	GetAdminCountInConversation(ctx context.Context, convID string) (int, error)
 	// ACID Transaction: Inserts message and atomically updates conversation head. Returns (isNew, error).
 	SaveMessage(ctx context.Context, msg *models.Message) (bool, error)
 
@@ -38,6 +51,8 @@ type ChatRepository interface {
 	AddGroupMember(ctx context.Context, convID string, userID int, role string) error
 	RemoveGroupMember(ctx context.Context, convID string, userID int) error
 
+	ProcessAckDelivered(ctx context.Context, convID string, userID int, messageID int64) (bool, error)
+	ProcessAckSeen(ctx context.Context, convID string, userID int, messageID int64) (bool, error)
 	UpdateLastReadWatermark(ctx context.Context, convID string, userID int, messageID int64) error
 	UpdateLastDeliveredWatermark(ctx context.Context, convID string, userID int, messageID int64) error
 	AreAllMembersDeliveredUpto(ctx context.Context, convID string, senderID int, messageID int64) (bool, error)
@@ -447,11 +462,33 @@ func (r *chatRepo) AddGroupMember(ctx context.Context, convID string, userID int
 	if role == "" {
 		role = "member"
 	}
+
+	// 1. Check if user exists in users table
+	var userExists bool
+	err := r.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)`, userID).Scan(&userExists)
+	if err != nil {
+		return err
+	}
+	if !userExists {
+		return ErrUserNotFound
+	}
+
+	// 2. Insert member; unique violation means already a member
 	query := `INSERT INTO conversation_members (conversation_id, user_id, role) 
-	          VALUES ($1, $2, $3) 
-	          ON CONFLICT (conversation_id, user_id) DO NOTHING`
-	_, err := r.db.ExecContext(ctx, query, convID, userID, role)
-	return err
+	          VALUES ($1, $2, $3)`
+	_, err = r.db.ExecContext(ctx, query, convID, userID, role)
+	if err != nil {
+		if pqErr, ok := err.(*pq.Error); ok {
+			if pqErr.Code == "23505" { // unique_violation
+				return ErrAlreadyMember
+			}
+			if pqErr.Code == "23503" { // foreign_key_violation
+				return ErrConversationNotFound
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 func (r *chatRepo) RemoveGroupMember(ctx context.Context, convID string, userID int) error {
@@ -465,7 +502,7 @@ func (r *chatRepo) RemoveGroupMember(ctx context.Context, convID string, userID 
 		return err
 	}
 	if rows == 0 {
-		return errors.New("member not found in this conversation")
+		return ErrMemberNotFound
 	}
 	return nil
 }
@@ -494,6 +531,98 @@ func (r *chatRepo) UpdateLastDeliveredWatermark(ctx context.Context, convID stri
 
 	_, err := r.db.ExecContext(ctx, query, messageID, convID, userID)
 	return err
+}
+
+func (r *chatRepo) ProcessAckDelivered(ctx context.Context, convID string, userID int, messageID int64) (bool, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	// 1. Advance delivered watermark monotonically
+	watermarkQuery := `
+		UPDATE conversation_members
+		SET last_delivered_message_id = $1
+		WHERE conversation_id = $2 
+		  AND user_id = $3 
+		  AND last_delivered_message_id < $1`
+	res, err := tx.ExecContext(ctx, watermarkQuery, messageID, convID, userID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	advanced := rows > 0
+
+	// 2. Insert or update delivery receipt (cannot downgrade from seen)
+	receiptQuery := `
+		INSERT INTO message_receipts (message_id, user_id, status, updated_at)
+		SELECT m.id, $2, 'delivered', NOW()
+		FROM messages m
+		WHERE m.id = $1
+		  AND EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = m.conversation_id AND user_id = $2)
+		ON CONFLICT (message_id, user_id) 
+		DO UPDATE SET status = 'delivered', updated_at = NOW()
+		WHERE message_receipts.status != 'seen'`
+	if _, err := tx.ExecContext(ctx, receiptQuery, messageID, userID); err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+
+	return advanced, nil
+}
+
+func (r *chatRepo) ProcessAckSeen(ctx context.Context, convID string, userID int, messageID int64) (bool, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	// 1. Advance read watermark monotonically (and ensure delivered watermark is at least equal)
+	watermarkQuery := `
+		UPDATE conversation_members
+		SET last_read_message_id = $1,
+		    last_delivered_message_id = GREATEST(last_delivered_message_id, $1)
+		WHERE conversation_id = $2 
+		  AND user_id = $3 
+		  AND last_read_message_id < $1`
+	res, err := tx.ExecContext(ctx, watermarkQuery, messageID, convID, userID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	advanced := rows > 0
+
+	// 2. Mark message receipts in range up to messageID as 'seen'
+	receiptQuery := `
+		INSERT INTO message_receipts (message_id, user_id, status, updated_at)
+		SELECT m.id, $1, 'seen', NOW()
+		FROM messages m
+		WHERE m.conversation_id = $2 
+		  AND m.id <= $3 
+		  AND m.sender_id != $1
+		  AND EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.conversation_id = $2 AND cm.user_id = $1)
+		ON CONFLICT (message_id, user_id) 
+		DO UPDATE SET status = 'seen', updated_at = NOW()`
+	if _, err := tx.ExecContext(ctx, receiptQuery, userID, convID, messageID); err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+
+	return advanced, nil
 }
 
 func (r *chatRepo) AreAllMembersDeliveredUpto(ctx context.Context, convID string, senderID int, messageID int64) (bool, error) {
@@ -577,14 +706,14 @@ func (r *chatRepo) UpdateGroupAvatar(ctx context.Context, convID string, avatarU
 	}
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
-		return errors.New("group not found or not a group")
+		return ErrConversationNotFound
 	}
 	return nil
 }
 
 func (r *chatRepo) GetConversationMembers(ctx context.Context, convID string) ([]models.ConversationMemberProfile, error) {
 	query := `
-		SELECT cm.conversation_id, cm.user_id, cm.role, cm.joined_at, u.name, u.email, u.avatar_url
+		SELECT cm.conversation_id, cm.user_id, cm.role, cm.joined_at, u.name, u.email, u.avatar_url, u.bio
 		FROM conversation_members cm
 		JOIN users u ON cm.user_id = u.id
 		WHERE cm.conversation_id = $1
@@ -599,12 +728,12 @@ func (r *chatRepo) GetConversationMembers(ctx context.Context, convID string) ([
 	var members []models.ConversationMemberProfile
 	for rows.Next() {
 		var m models.ConversationMemberProfile
-		if err := rows.Scan(&m.ConversationID, &m.UserID, &m.Role, &m.JoinedAt, &m.Name, &m.Email, &m.AvatarURL); err != nil {
+		if err := rows.Scan(&m.ConversationID, &m.UserID, &m.Role, &m.JoinedAt, &m.Name, &m.Email, &m.AvatarURL, &m.Bio); err != nil {
 			return nil, err
 		}
 		members = append(members, m)
 	}
-	return members, nil
+	return members, rows.Err()
 }
 
 func (r *chatRepo) GetUserRoleInConversation(ctx context.Context, convID string, userID int) (string, error) {
@@ -612,12 +741,19 @@ func (r *chatRepo) GetUserRoleInConversation(ctx context.Context, convID string,
 	var role string
 	err := r.db.QueryRowContext(ctx, query, convID, userID).Scan(&role)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return "", errors.New("user is not a member of this conversation")
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotMember
 		}
 		return "", err
 	}
 	return role, nil
+}
+
+func (r *chatRepo) GetAdminCountInConversation(ctx context.Context, convID string) (int, error) {
+	query := `SELECT COUNT(*) FROM conversation_members WHERE conversation_id = $1 AND role = 'admin'`
+	var count int
+	err := r.db.QueryRowContext(ctx, query, convID).Scan(&count)
+	return count, err
 }
 
 func (r *chatRepo) SyncUserDelivery(ctx context.Context, userID int) ([]models.DeliverySyncResult, error) {
@@ -627,7 +763,7 @@ func (r *chatRepo) SyncUserDelivery(ctx context.Context, userID int) ([]models.D
 		SELECT 
 			c.id, 
 			c.last_message_id, 
-			COALESCE(c.last_message_sender_id, 0)
+			cm.last_delivered_message_id
 		FROM conversation_members cm
 		JOIN conversations c ON cm.conversation_id = c.id
 		WHERE cm.user_id = $1 
@@ -641,15 +777,15 @@ func (r *chatRepo) SyncUserDelivery(ctx context.Context, userID int) ([]models.D
 	defer rows.Close()
 
 	type pendingSync struct {
-		convID    string
-		lastMsgID int64
-		senderID  int
+		convID         string
+		lastMsgID      int64
+		oldDeliveredID int64
 	}
 	var pending []pendingSync
 
 	for rows.Next() {
 		var p pendingSync
-		if err := rows.Scan(&p.convID, &p.lastMsgID, &p.senderID); err == nil {
+		if err := rows.Scan(&p.convID, &p.lastMsgID, &p.oldDeliveredID); err == nil {
 			pending = append(pending, p)
 		}
 	}
@@ -658,17 +794,46 @@ func (r *chatRepo) SyncUserDelivery(ctx context.Context, userID int) ([]models.D
 
 	for _, p := range pending {
 		// Update this user's delivered watermark in DB
-		_ = r.UpdateLastDeliveredWatermark(ctx, p.convID, userID, p.lastMsgID)
-
-		// Check if ALL other members in this conversation have now received up to this message
-		allDelivered, err := r.AreAllMembersDeliveredUpto(ctx, p.convID, p.senderID, p.lastMsgID)
-		if err == nil && allDelivered {
-			results = append(results, models.DeliverySyncResult{
-				ConversationID: p.convID,
-				UptoMessageID:  p.lastMsgID,
-				SenderID:       p.senderID,
-			})
+		if err := r.UpdateLastDeliveredWatermark(ctx, p.convID, userID, p.lastMsgID); err != nil {
+			continue
 		}
+
+		// Find distinct senders and their messages in the newly delivered range (id > oldDeliveredID AND id <= lastMsgID)
+		msgQuery := `
+			SELECT sender_id, id
+			FROM messages
+			WHERE conversation_id = $1
+			  AND id > $2
+			  AND id <= $3
+			  AND sender_id != $4
+			ORDER BY id DESC
+		`
+		msgRows, err := r.db.QueryContext(ctx, msgQuery, p.convID, p.oldDeliveredID, p.lastMsgID, userID)
+		if err != nil {
+			continue
+		}
+
+		seenSenders := make(map[int]bool)
+		for msgRows.Next() {
+			var sID int
+			var mID int64
+			if err := msgRows.Scan(&sID, &mID); err != nil {
+				continue
+			}
+			if seenSenders[sID] {
+				continue
+			}
+			allDelivered, err := r.AreAllMembersDeliveredUpto(ctx, p.convID, sID, mID)
+			if err == nil && allDelivered {
+				results = append(results, models.DeliverySyncResult{
+					ConversationID: p.convID,
+					UptoMessageID:  mID,
+					SenderID:       sID,
+				})
+				seenSenders[sID] = true
+			}
+		}
+		msgRows.Close()
 	}
 
 	return results, nil

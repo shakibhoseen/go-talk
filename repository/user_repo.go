@@ -18,6 +18,7 @@ type UserRepository interface {
 	SaveRefreshToken(ctx context.Context, userID int, tokenStr string, expiresAt time.Time) error
 	GetRefreshToken(ctx context.Context, tokenStr string) (int, error) // Returns userID
 	DeleteRefreshToken(ctx context.Context, tokenStr string) error
+	GetAllUsers(ctx context.Context, excludeUserID int) ([]models.User, error)
 }
 
 type userRepo struct {
@@ -113,3 +114,26 @@ func (r *userRepo) DeleteRefreshToken(ctx context.Context, tokenStr string) erro
 	_, err := r.db.ExecContext(ctx, query, tokenStr)
 	return err
 }
+
+func (r *userRepo) GetAllUsers(ctx context.Context, excludeUserID int) ([]models.User, error) {
+	query := `SELECT id, name, email, avatar_url, bio, created_at FROM users WHERE id != $1 ORDER BY name ASC`
+	rows, err := r.db.QueryContext(ctx, query, excludeUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []models.User
+	for rows.Next() {
+		var u models.User
+		if err := rows.Scan(&u.ID, &u.Name, &u.Email, &u.AvatarURL, &u.Bio, &u.CreatedAt); err != nil {
+			return nil, err
+		}
+		users = append(users, u)
+	}
+	if users == nil {
+		users = []models.User{}
+	}
+	return users, rows.Err()
+}
+
