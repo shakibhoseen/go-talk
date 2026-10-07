@@ -14,11 +14,19 @@ import (
 )
 
 type AuthHandler struct {
-	authSvc service.AuthService
+	authSvc  service.AuthService
+	presence PresenceProvider
 }
 
-func NewAuthHandler(authSvc service.AuthService) *AuthHandler {
-	return &AuthHandler{authSvc: authSvc}
+func NewAuthHandler(authSvc service.AuthService, presence ...PresenceProvider) *AuthHandler {
+	var p PresenceProvider
+	if len(presence) > 0 {
+		p = presence[0]
+	}
+	return &AuthHandler{
+		authSvc:  authSvc,
+		presence: p,
+	}
 }
 
 func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
@@ -282,9 +290,27 @@ func (h *AuthHandler) GetUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.presence != nil {
+		for i := range users {
+			users[i].IsOnline = h.presence.IsUserOnline(users[i].ID)
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"users": users,
+	})
+}
+
+// GET /presence
+func (h *AuthHandler) GetPresence(w http.ResponseWriter, r *http.Request) {
+	onlineIDs := []int{}
+	if h.presence != nil {
+		onlineIDs = h.presence.GetOnlineUserIDs()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"online_user_ids": onlineIDs,
 	})
 }
 

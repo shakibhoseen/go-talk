@@ -21,6 +21,7 @@ type Conversation struct {
 	LastMessageAt       *time.Time       `json:"last_message_at,omitempty"`
 	UnreadCount         int              `json:"unread_count"`
 	OtherUserID         *int             `json:"other_user_id,omitempty"`
+	IsOnline            bool             `json:"is_online,omitempty"`
 	CreatedAt           time.Time        `json:"created_at"`
 }
 
@@ -47,6 +48,7 @@ type ConversationMemberProfile struct {
 	Email          string    `json:"email"`
 	AvatarURL      *string   `json:"avatar_url,omitempty"`
 	Bio            *string   `json:"bio,omitempty"`
+	IsOnline       bool      `json:"is_online"`
 }
 
 type UpdateGroupAvatarRequest struct {

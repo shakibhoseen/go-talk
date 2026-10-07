@@ -24,14 +24,20 @@ func isValidUUID(u string) bool {
 }
 
 type ChatHandler struct {
-	chatSvc service.ChatService
-	authSvc service.AuthService
+	chatSvc  service.ChatService
+	authSvc  service.AuthService
+	presence PresenceProvider
 }
 
-func NewChatHandler(chatSvc service.ChatService, authSvc service.AuthService) *ChatHandler {
+func NewChatHandler(chatSvc service.ChatService, authSvc service.AuthService, presence ...PresenceProvider) *ChatHandler {
+	var p PresenceProvider
+	if len(presence) > 0 {
+		p = presence[0]
+	}
 	return &ChatHandler{
-		chatSvc: chatSvc,
-		authSvc: authSvc,
+		chatSvc:  chatSvc,
+		authSvc:  authSvc,
+		presence: p,
 	}
 }
 
@@ -91,6 +97,14 @@ func (h *ChatHandler) GetConversations(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "Failed to fetch conversations", http.StatusInternalServerError)
 		return
+	}
+
+	if h.presence != nil {
+		for i := range convs {
+			if convs[i].Type == models.DirectChat && convs[i].OtherUserID != nil {
+				convs[i].IsOnline = h.presence.IsUserOnline(*convs[i].OtherUserID)
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -338,7 +352,7 @@ func (h *ChatHandler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, repository.ErrCannotRemoveOnlyAdmin) {
-			http.Error(w, "Cannot remove the only group admin", http.StatusBadRequest)
+			http.Error(w, "Forbidden: cannot leave or remove the only group admin", http.StatusForbidden)
 			return
 		}
 		if errors.Is(err, repository.ErrMemberNotFound) {
@@ -475,6 +489,12 @@ func (h *ChatHandler) GetConversationMembers(w http.ResponseWriter, r *http.Requ
 		}
 		http.Error(w, "Failed to get members: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	if h.presence != nil {
+		for i := range members {
+			members[i].IsOnline = h.presence.IsUserOnline(members[i].UserID)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

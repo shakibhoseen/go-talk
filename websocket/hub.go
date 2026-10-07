@@ -40,13 +40,18 @@ func (h *Hub) Run() {
 			if _, ok := h.clients[client.UserID]; !ok {
 				h.clients[client.UserID] = make(map[*Client]bool)
 			}
+			isFirstConn := len(h.clients[client.UserID]) == 0
 			h.clients[client.UserID][client] = true
 			h.mu.Unlock()
 			log.Printf("User %d connected. Total sessions for user: %d\n", client.UserID, len(h.clients[client.UserID]))
+			if isFirstConn {
+				go h.BroadcastPresence(client.UserID, true)
+			}
 			go h.DeliverOfflineMessagesOnConnect(client.UserID)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
+			var isLastConn bool
 			if userConns, ok := h.clients[client.UserID]; ok {
 				if _, exists := userConns[client]; exists {
 					delete(userConns, client)
@@ -54,11 +59,15 @@ func (h *Hub) Run() {
 					client.closeOnce.Do(func() { close(client.send) })
 					if len(userConns) == 0 {
 						delete(h.clients, client.UserID)
+						isLastConn = true
 					}
 					log.Printf("User %d disconnected\n", client.UserID)
 				}
 			}
 			h.mu.Unlock()
+			if isLastConn {
+				go h.BroadcastPresence(client.UserID, false)
+			}
 
 		case message := <-h.broadcast:
 			// Global broadcast (used for system maintenance announcements)
@@ -75,6 +84,58 @@ func (h *Hub) Run() {
 				}
 			}
 			h.mu.Unlock()
+		}
+	}
+}
+
+// IsUserOnline returns true if the user has at least one active connection
+func (h *Hub) IsUserOnline(userID int) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	conns, ok := h.clients[userID]
+	return ok && len(conns) > 0
+}
+
+// GetOnlineUserIDs returns the IDs of all currently connected users
+func (h *Hub) GetOnlineUserIDs() []int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	ids := make([]int, 0, len(h.clients))
+	for id, conns := range h.clients {
+		if len(conns) > 0 {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// BroadcastPresence sends a user_presence event to all connected users
+func (h *Hub) BroadcastPresence(userID int, isOnline bool) {
+	payload := UserPresencePayload{
+		UserID:   userID,
+		IsOnline: isOnline,
+	}
+	bytes, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	envelope, err := json.Marshal(Event{
+		Type:    EventUserPresence,
+		Payload: bytes,
+	})
+	if err != nil {
+		return
+	}
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, userConns := range h.clients {
+		for client := range userConns {
+			select {
+			case client.send <- envelope:
+			default:
+				// Slow client: drop non-critical presence update to prevent stalling
+			}
 		}
 	}
 }

@@ -14,6 +14,7 @@ type User struct {
 	PasswordHash string    `json:"-"`
 	AvatarURL    *string   `json:"avatar_url,omitempty"`
 	Bio          *string   `json:"bio,omitempty"`
+	IsOnline     bool      `json:"is_online"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 

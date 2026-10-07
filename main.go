@@ -35,9 +35,9 @@ func main() {
 	go hub.Run()
 
 	// 5. Handlers
-	authHandler := handlers.NewAuthHandler(authSvc)
+	authHandler := handlers.NewAuthHandler(authSvc, hub)
 	wsHandler := handlers.NewWSHandler(hub, authSvc)
-	chatHandler := handlers.NewChatHandler(chatSvc, authSvc)
+	chatHandler := handlers.NewChatHandler(chatSvc, authSvc, hub)
 
 	// 6. Router Setup
 	mux := http.NewServeMux()
@@ -47,6 +47,7 @@ func main() {
 	mux.HandleFunc("POST /auth/logout", authHandler.Logout)        // নতুন
 	mux.HandleFunc("GET /users/me", authHandler.GetMe)
 	mux.HandleFunc("GET /users", authHandler.GetUsers)
+	mux.HandleFunc("GET /presence", authHandler.GetPresence)
 	mux.HandleFunc("PUT /users/me/name", authHandler.UpdateName)
 	mux.HandleFunc("PUT /users/me/bio", authHandler.UpdateBio)
 	mux.HandleFunc("POST /users/me/avatar", authHandler.UploadAvatar)

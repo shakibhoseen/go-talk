@@ -15,6 +15,9 @@ const (
 	EventAckSeen       EventType = "ack_seen"
 	EventStatusUpdated EventType = "status_updated"
 
+	// Presence Events
+	EventUserPresence EventType = "user_presence"
+
 	// Real-time Indicators
 	EventTyping EventType = "typing"
 
@@ -24,6 +27,11 @@ const (
 	EventIceCandidate EventType = "ice_candidate"
 	EventCallEnd      EventType = "call_end"
 )
+
+type UserPresencePayload struct {
+	UserID   int  `json:"user_id"`
+	IsOnline bool `json:"is_online"`
+}
 
 // Event is the standardized JSON envelope sent over WebSocket
 type Event struct {

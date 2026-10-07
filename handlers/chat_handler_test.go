@@ -999,6 +999,7 @@ func TestRemoveMemberHandler(t *testing.T) {
 		convID, uAdmin1, uAdmin2, uMember1, uMember2)
 
 	admin1Token, _ := tokenMaker.CreateToken(uAdmin1, "a1@test.com", time.Hour)
+	admin2Token, _ := tokenMaker.CreateToken(uAdmin2, "a2@test.com", time.Hour)
 	member1Token, _ := tokenMaker.CreateToken(uMember1, "m1@test.com", time.Hour)
 	nonMemberToken, _ := tokenMaker.CreateToken(uNonMember, "nm@test.com", time.Hour)
 
@@ -1097,11 +1098,11 @@ func TestRemoveMemberHandler(t *testing.T) {
 		}
 	})
 
-	t.Run("Admin can remove another admin when multiple admins exist", func(t *testing.T) {
+	t.Run("Admin leaves when another admin exists (returns 200 OK)", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/conversations/%s/members/%d", convID, uAdmin2), nil)
 		req.SetPathValue("id", convID)
 		req.SetPathValue("user_id", fmt.Sprintf("%d", uAdmin2))
-		req.Header.Set("Authorization", "Bearer "+admin1Token)
+		req.Header.Set("Authorization", "Bearer "+admin2Token)
 		rr := httptest.NewRecorder()
 
 		chatHandler.RemoveMember(rr, req)
@@ -1117,6 +1118,26 @@ func TestRemoveMemberHandler(t *testing.T) {
 		}
 	})
 
+	t.Run("Only admin tries to leave returns 403 Forbidden", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/conversations/%s/members/%d", convID, uAdmin1), nil)
+		req.SetPathValue("id", convID)
+		req.SetPathValue("user_id", fmt.Sprintf("%d", uAdmin1))
+		req.Header.Set("Authorization", "Bearer "+admin1Token)
+		rr := httptest.NewRecorder()
+
+		chatHandler.RemoveMember(rr, req)
+
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("Expected 403 Forbidden for only admin leaving, got %d: %s", rr.Code, rr.Body.String())
+		}
+
+		var exists bool
+		_ = db.QueryRow(`SELECT EXISTS(SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2)`, convID, uAdmin1).Scan(&exists)
+		if !exists {
+			t.Errorf("Expected only admin 1 to remain in group")
+		}
+	})
+
 	t.Run("Only-admin protection prevents removing the last remaining admin", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/conversations/%s/members/%d", convID, uAdmin1), nil)
 		req.SetPathValue("id", convID)
@@ -1126,8 +1147,8 @@ func TestRemoveMemberHandler(t *testing.T) {
 
 		chatHandler.RemoveMember(rr, req)
 
-		if rr.Code != http.StatusBadRequest {
-			t.Fatalf("Expected 400 Bad Request for removing only admin, got %d: %s", rr.Code, rr.Body.String())
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("Expected 403 Forbidden for removing only admin, got %d: %s", rr.Code, rr.Body.String())
 		}
 	})
 }

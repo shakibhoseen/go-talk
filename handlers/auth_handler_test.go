@@ -145,4 +145,71 @@ func TestGetUsersHandler(t *testing.T) {
 			t.Fatalf("Expected status 401 for unauthenticated request, got %d", rr.Code)
 		}
 	})
+
+	t.Run("GetUsers populates is_online and GetPresence returns online user IDs", func(t *testing.T) {
+		mockP := &mockPresence{
+			onlineIDs: map[int]bool{
+				uBob: true,
+			},
+		}
+		handlerWithPresence := handlers.NewAuthHandler(authSvc, mockP)
+
+		// 1. Test /users returns is_online for Bob
+		req := httptest.NewRequest(http.MethodGet, "/users", nil)
+		req.Header.Set("Authorization", "Bearer "+aliceToken)
+		rr := httptest.NewRecorder()
+		handlerWithPresence.GetUsers(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("Expected 200, got %d", rr.Code)
+		}
+
+		var resp map[string][]map[string]any
+		_ = json.NewDecoder(rr.Body).Decode(&resp)
+		users := resp["users"]
+
+		for _, u := range users {
+			id := int(u["id"].(float64))
+			isOnline, _ := u["is_online"].(bool)
+			if id == uBob && !isOnline {
+				t.Errorf("Expected Bob (%d) to be online", uBob)
+			}
+			if id == uCharlie && isOnline {
+				t.Errorf("Expected Charlie (%d) to be offline", uCharlie)
+			}
+		}
+
+		// 2. Test /presence
+		reqPres := httptest.NewRequest(http.MethodGet, "/presence", nil)
+		rrPres := httptest.NewRecorder()
+		handlerWithPresence.GetPresence(rrPres, reqPres)
+
+		if rrPres.Code != http.StatusOK {
+			t.Fatalf("Expected 200, got %d", rrPres.Code)
+		}
+
+		var presResp map[string][]int
+		_ = json.NewDecoder(rrPres.Body).Decode(&presResp)
+		if len(presResp["online_user_ids"]) != 1 || presResp["online_user_ids"][0] != uBob {
+			t.Errorf("Expected online_user_ids to contain Bob (%d), got %v", uBob, presResp["online_user_ids"])
+		}
+	})
+}
+
+type mockPresence struct {
+	onlineIDs map[int]bool
+}
+
+func (m *mockPresence) IsUserOnline(userID int) bool {
+	return m.onlineIDs[userID]
+}
+
+func (m *mockPresence) GetOnlineUserIDs() []int {
+	var ids []int
+	for id, on := range m.onlineIDs {
+		if on {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
