@@ -8,6 +8,10 @@ import (
 	"time"
 )
 
+var (
+	ErrRefreshTokenNotFound = errors.New("invalid or expired refresh token")
+)
+
 type UserRepository interface {
 	CreateUser(ctx context.Context, name, email, passwordHash string) (*models.User, error)
 	GetByEmail(ctx context.Context, email string) (*models.User, error)
@@ -103,7 +107,7 @@ func (r *userRepo) GetRefreshToken(ctx context.Context, tokenStr string) (int, e
 	err := r.db.QueryRowContext(ctx, query, tokenStr).Scan(&userID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return 0, errors.New("invalid or expired refresh token")
+			return 0, ErrRefreshTokenNotFound
 		}
 		return 0, err
 	}

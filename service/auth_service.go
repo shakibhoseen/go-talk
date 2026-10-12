@@ -11,6 +11,12 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+var (
+	ErrInvalidRefreshToken    = errors.New("unauthorized: invalid refresh token")
+	ErrTokenRevokedOrNotFound = errors.New("unauthorized: token revoked or not found")
+	ErrUserNotFound           = errors.New("user not found")
+)
+
 type AuthService interface {
 	Register(ctx context.Context, req *models.RegisterRequest) (*models.User, error)
 	Login(ctx context.Context, req *models.LoginRequest) (*models.AuthResponse, error)
@@ -121,18 +127,27 @@ func (s *authService) RefreshToken(ctx context.Context, req *models.RefreshReque
 	// ১. টোকেনটি ভ্যালিড কি না চেক করুন
 	userID, err := s.tokenMaker.VerifyToken(req.RefreshToken)
 	if err != nil {
-		return nil, errors.New("unauthorized: invalid refresh token")
+		return nil, ErrInvalidRefreshToken
 	}
 
 	// ২. ডাটাবেসে টোকেনটি আছে কি না চেক করুন (White-listing)
 	dbUserID, err := s.userRepo.GetRefreshToken(ctx, req.RefreshToken)
-	if err != nil || dbUserID != userID {
-		return nil, errors.New("unauthorized: token revoked or not found")
+	if err != nil {
+		if errors.Is(err, repository.ErrRefreshTokenNotFound) {
+			return nil, ErrTokenRevokedOrNotFound
+		}
+		return nil, err
+	}
+	if dbUserID != userID {
+		return nil, ErrTokenRevokedOrNotFound
 	}
 
 	u, err := s.userRepo.GetByID(ctx, userID)
-	if err != nil || u == nil {
-		return nil, errors.New("user not found")
+	if err != nil {
+		return nil, err
+	}
+	if u == nil {
+		return nil, ErrUserNotFound
 	}
 
 	// ৩. নতুন Access Token তৈরি করুন

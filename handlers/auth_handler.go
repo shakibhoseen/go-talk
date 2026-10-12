@@ -2,10 +2,12 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go-talk/models"
 	"go-talk/service"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -180,7 +182,14 @@ func (h *AuthHandler) RefreshToken(w http.ResponseWriter, r *http.Request) {
 	}
 	authResponse, err := h.authSvc.RefreshToken(r.Context(), &req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+		if errors.Is(err, service.ErrInvalidRefreshToken) ||
+			errors.Is(err, service.ErrTokenRevokedOrNotFound) ||
+			errors.Is(err, service.ErrUserNotFound) {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		log.Printf("RefreshToken internal error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
